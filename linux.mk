@@ -14,10 +14,10 @@ export LD_LIBRARY_PATH ?= $(HOME)/lib:$(shell find $(PREFIX)/lib/ -name '*x86_64
 # Build Configuration
 #=======================================================================================================================
 
-export BUILD := release
-ifeq ($(DEBUG),yes)
-export RUST_LOG ?= trace
 export BUILD := dev
+ifeq ($(DEBUG),no)
+export RUST_LOG ?= info
+export BUILD := release
 endif
 
 #=======================================================================================================================
@@ -221,3 +221,6 @@ test-integration-rust:
 # Cleans dangling test resources.
 test-clean:
 	rm -f /dev/shm/demikernel-*
+
+example-tcpdump:
+	$(CARGO) run --example tcp-dump $(CARGO_FLAGS) $(CARGO_FEATURES) -- $(ARGS)

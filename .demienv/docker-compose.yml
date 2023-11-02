@@ -1,0 +1,30 @@
+services:
+  devcontainer:
+    # platform: linux/amd64
+    environment:
+      # - ARGS=--local 127.0.0.1:12345
+      - DEBUG=yes
+    build:
+      context: ../
+      dockerfile: .demienv/Dockerfile
+    ports:
+      - "12345:12345"
+    volumes:
+      - ../..:/workspaces:cached
+    command: sleep infinity
+    # tcpdump:
+    #   platform: linux/amd64
+    #   build:
+    #     context: ../
+    #     dockerfile: .docker/Dockerfile
+    #   command: make example-tcpdump
+
+    # env:
+    #   platform: linux/amd64
+    #   build:
+    #     context: ../
+    #     dockerfile: .docker/Dockerfile
+    #   command: sh -c "while sleep 1000; do :; done"
+
+
+

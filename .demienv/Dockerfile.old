@@ -1,0 +1,11 @@
+FROM ubuntu:20.04
+
+RUN curl -L https://nixos.org/nix/install | sh -s
+
+RUN nix-env -iA nixpkgs.dpdk
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+COPY ../ /code
+
+WORKDIR /code

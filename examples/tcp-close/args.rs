@@ -44,7 +44,7 @@ impl ProgramArguments {
                 Arg::new("addr")
                     .long("address")
                     .value_parser(clap::value_parser!(String))
-                    .required(true)
+                    .required(false)
                     .value_name("ADDRESS:PORT")
                     .help("Sets socket address"),
             )

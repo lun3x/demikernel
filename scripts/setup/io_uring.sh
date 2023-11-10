@@ -26,3 +26,6 @@ make install
 # Cleanup.
 popd
 rm -rf $HOME/tmp/liburing
+
+# export PKG_CONFIG_PATH=/root/lib/pkgconfig
+# export LD_LIBRARY_PATH=/root/lib

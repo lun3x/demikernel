@@ -71,7 +71,7 @@ pub struct ProgramArguments {
 /// Associate functions for Program Arguments
 impl ProgramArguments {
     /// Default local address.
-    const DEFAULT_LOCAL: &'static str = "127.0.0.1:12345";
+    const DEFAULT_LOCAL: &'static str = "127.0.0.1:12346";
 
     /// Parses the program arguments from the command line interface.
     pub fn new(app_name: &'static str, app_author: &'static str, app_about: &'static str) -> Result<Self> {
@@ -193,8 +193,7 @@ impl Application {
                 demi_opcode_t::DEMI_OPC_POP => {
                     let sockqd: QDesc = qr.qr_qd.into();
                     let sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
-                    let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(&unsafe { qr.qr_value.sga.sga_addr })
-                    {
+                    let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(&unsafe { qr.qr_value.sga.sga_addr }) {
                         Ok(saddr) => SocketAddr::V4(saddr),
                         Err(e) => {
                             // If error, free scatter-gather array.

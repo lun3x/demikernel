@@ -33,6 +33,7 @@ use ::std::{
         Instant,
     },
 };
+use std::collections::HashSet;
 
 #[cfg(target_os = "windows")]
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
@@ -117,7 +118,7 @@ struct Application {
 /// Associated Functions for the Application
 impl Application {
     /// Logging interval (in seconds).
-    const LOG_INTERVAL: u64 = 5;
+    const LOG_INTERVAL: u64 = 1;
 
     /// Instantiates the application.
     pub fn new(mut libos: LibOS, args: &ProgramArguments) -> Result<Self> {
@@ -168,7 +169,7 @@ impl Application {
         let mut nbytes: usize = 0;
         let mut qtokens: Vec<QToken> = Vec::new();
         let mut last_log: Instant = Instant::now();
-        let mut clients: Vec<QDesc> = Vec::default();
+        let mut clients: HashSet<QDesc> = Default::default();
 
         // Accept first connection.
         match self.libos.accept(self.sockqd) {
@@ -205,7 +206,7 @@ impl Application {
 
                     // Pop first packet from this connection.
                     let sockqd: QDesc = unsafe { qr.qr_value.ares.qd.into() };
-                    clients.push(sockqd);
+                    clients.insert(sockqd);
                     match self.libos.pop(sockqd, None) {
                         Ok(qt) => qtokens.push(qt),
                         Err(e) => anyhow::bail!("failed to pop data from socket: {:?}", e),
@@ -221,18 +222,25 @@ impl Application {
                 demi_opcode_t::DEMI_OPC_POP => {
                     let sockqd: QDesc = qr.qr_qd.into();
                     let sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
+                    let seglen = sga.sga_segs[0].sgaseg_len as usize;
+
                     nbytes += sga.sga_segs[0].sgaseg_len as usize;
                     if let Err(e) = self.libos.sgafree(sga) {
                         println!("ERROR: sgafree() failed (error={:?})", e);
                         println!("WARN: leaking sga");
                     }
 
-                    // Pop another packet.
-                    let qt: QToken = match self.libos.pop(sockqd, None) {
-                        Ok(qt) => qt,
-                        Err(e) => anyhow::bail!("failed to pop data from socket: {:?}", e),
-                    };
-                    qtokens.push(qt);
+                    if seglen == 0 {
+                        println!("client disconnected without FIN");
+                        clients.remove(&sockqd);
+                    } else {
+                        // Pop another packet.
+                        let qt: QToken = match self.libos.pop(sockqd, None) {
+                            Ok(qt) => qt,
+                            Err(e) => anyhow::bail!("failed to pop data from socket: {:?}", e),
+                        };
+                        qtokens.push(qt);
+                    }
                 },
                 demi_opcode_t::DEMI_OPC_FAILED => anyhow::bail!("operation failed"),
                 _ => anyhow::bail!("unexpected result"),

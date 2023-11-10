@@ -66,7 +66,7 @@ impl ProgramArguments {
     // Default injection rate.
     const DEFAULT_INJECTION_RATE: u64 = 100;
     /// Default host address.
-    const DEFAULT_REMOTE: &'static str = "127.0.0.1:23456";
+    const DEFAULT_REMOTE: &'static str = "127.0.0.1:12345";
 
     /// Parses the program arguments from the command line interface.
     pub fn new(app_name: &'static str, app_author: &'static str, app_about: &'static str) -> Result<Self> {
@@ -77,7 +77,7 @@ impl ProgramArguments {
                 Arg::new("remote")
                     .long("remote")
                     .value_parser(clap::value_parser!(String))
-                    .required(true)
+                    .required(false)
                     .value_name("ADDRESS:PORT")
                     .help("Sets remote address"),
             )
@@ -85,7 +85,7 @@ impl ProgramArguments {
                 Arg::new("bufsize")
                     .long("bufsize")
                     .value_parser(clap::value_parser!(String))
-                    .required(true)
+                    .required(false)
                     .value_name("SIZE")
                     .help("Sets buffer size"),
             )
@@ -93,7 +93,7 @@ impl ProgramArguments {
                 Arg::new("injection_rate")
                     .long("injection_rate")
                     .value_parser(clap::value_parser!(String))
-                    .required(true)
+                    .required(false)
                     .value_name("RATE")
                     .help("Sets packet injection rate"),
             )
@@ -187,7 +187,8 @@ struct Application {
 /// Associated Functions for the Application
 impl Application {
     /// Logging interval (in seconds).
-    const LOG_INTERVAL: u64 = 5;
+    const LOG_INTERVAL: u64 = 1;
+    const TOTAL_RUNTIME: u64 = 5;
 
     /// Instantiates the application.
     pub fn new(mut libos: LibOS, args: &ProgramArguments) -> Result<Self> {
@@ -253,7 +254,7 @@ impl Application {
         let mut last_push: Instant = Instant::now();
         let mut last_log: Instant = Instant::now();
 
-        loop {
+        while start.elapsed() < Duration::from_secs(Self::TOTAL_RUNTIME) {
             // Dump statistics.
             if last_log.elapsed() > Duration::from_secs(Self::LOG_INTERVAL) {
                 let elapsed: Duration = Instant::now() - start;
@@ -301,6 +302,8 @@ impl Application {
                 last_push = Instant::now();
             }
         }
+
+        Ok(())
     }
 
     // Makes a scatter-gather array.
@@ -342,9 +345,28 @@ impl Application {
 
 impl Drop for Application {
     fn drop(&mut self) {
-        if let Err(e) = self.libos.close(self.sockqd) {
-            println!("ERROR: close() failed (error={:?}", e);
-            println!("WARN: leaking sockqd={:?}", self.sockqd);
+        let qt = match self.libos.async_close(self.sockqd) {
+            Ok(qt) => qt,
+            Err(e) => {
+                println!("ERROR: close() failed (error={:?}", e);
+                println!("WARN: leaking sockqd={:?}", self.sockqd);
+                return;
+            },
+        };
+
+        match self.libos.wait(qt, None) {
+            Ok(qr) => match qr.qr_opcode {
+                demi_opcode_t::DEMI_OPC_CLOSE => {
+                    println!("Successfully closed")
+                },
+                _ => {
+                    println!("ERROR: unexpected opcode: {:?}", qr.qr_opcode);
+                },
+            },
+            Err(e) => {
+                println!("ERROR: wait() failed (error={:?}", e);
+                println!("WARN: leaking sockqd={:?}", self.sockqd);
+            },
         }
     }
 }

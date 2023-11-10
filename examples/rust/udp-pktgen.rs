@@ -247,6 +247,17 @@ impl Application {
             },
         };
 
+        // let qt = libos.connect(sockqd, remote).unwrap();
+        // match libos.wait(qt, None) {
+        //     Ok(qr) => match qr.qr_opcode {
+        //         demi_opcode_t::DEMI_OPC_CONNECT => {
+        //             println!("CONNECTED to {:?}", remote)
+        //         },
+        //         _ => todo!(),
+        //     },
+        //     Err(_) => todo!(),
+        // }
+
         println!("Local Address:  {:?}", local);
         println!("Remote Address: {:?}", remote);
 
@@ -278,7 +289,7 @@ impl Application {
             if last_push.elapsed() > Duration::from_nanos(self.injection_rate) {
                 let sga: demi_sgarray_t = self.mksga(self.bufsize, 0x65)?;
 
-                let qt: QToken = match self.libos.pushto(self.sockqd, &sga, self.remote) {
+                let qt: QToken = match self.libos.push(self.sockqd, &sga) {
                     Ok(qt) => qt,
                     Err(e) => {
                         // If error, free scatter-gather array.

@@ -158,7 +158,7 @@ impl SharedCatnapQueue {
 
     /// Asynchronously connects the target queue to a remote address. This function contains all of the single-queue,
     /// asynchronous code necessary to run a connect and any single-queue functionality after the connect completes.
-    pub async fn do_connect(&mut self, remote: SocketAddrV4, yielder: Yielder) -> Result<(), Fail> {
+    pub async fn do_connect(&mut self, remote: SocketAddrV4, yielder: Yielder) -> Result<SocketAddrV4, Fail> {
         loop {
             match self.socket.try_connect(remote) {
                 Ok(r) => return Ok(r),

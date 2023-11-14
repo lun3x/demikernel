@@ -586,7 +586,7 @@ pub fn connection_setup<const N: usize>(
         _ => anyhow::bail!("accept should have completed"),
     };
     match Future::poll(Pin::new(&mut connect_future), ctx) {
-        Poll::Ready(Ok(())) => {},
+        Poll::Ready(Ok(_local_addr)) => {},
         _ => anyhow::bail!("connect should have completed"),
     };
 

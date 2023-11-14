@@ -322,10 +322,10 @@ impl<const N: usize> InetStack<N> {
                 let future: ConnectFuture<N> = self.ipv4.tcp.connect(qd, remote)?;
                 let coroutine: Pin<Box<Operation>> = Box::pin(async move {
                     // Wait for connect to complete.
-                    let result: Result<(), Fail> = future.await;
+                    let result: Result<SocketAddrV4, Fail> = future.await;
                     // Handle result.
                     match result {
-                        Ok(()) => (qd, OperationResult::Connect),
+                        Ok(addr) => (qd, OperationResult::Connect(addr)),
                         Err(e) => (qd, OperationResult::Failed(e)),
                     }
                 });

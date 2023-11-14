@@ -21,7 +21,7 @@ use ::std::{
 
 #[derive(Clone)]
 pub enum OperationResult {
-    Connect,
+    Connect(SocketAddrV4),
     Accept((QDesc, SocketAddrV4)),
     Push,
     Pop(Option<SocketAddrV4>, DemiBuffer),
@@ -36,7 +36,7 @@ pub enum OperationResult {
 impl fmt::Debug for OperationResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            OperationResult::Connect => write!(f, "Connect"),
+            OperationResult::Connect(..) => write!(f, "Connect"),
             OperationResult::Accept(..) => write!(f, "Accept"),
             OperationResult::Push => write!(f, "Push"),
             OperationResult::Pop(..) => write!(f, "Pop"),

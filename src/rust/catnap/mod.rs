@@ -33,6 +33,7 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
+        network::unwrap_socketaddr,
         queue::{
             downcast_queue,
             downcast_queue_ptr,
@@ -43,12 +44,12 @@ use crate::{
         },
         types::{
             demi_accept_result_t,
+            demi_connect_result_t,
             demi_opcode_t,
             demi_qr_value_t,
             demi_qresult_t,
             demi_sgarray_t,
         },
-        network::unwrap_socketaddr,
         QDesc,
         QToken,
         SharedDemiRuntime,
@@ -63,8 +64,8 @@ use ::std::{
     mem,
     net::{
         Ipv4Addr,
-        SocketAddrV4,
         SocketAddr,
+        SocketAddrV4,
     },
     ops::{
         Deref,
@@ -271,7 +272,7 @@ impl SharedCatnapLibOS {
         };
         // Wait for connect operation to complete.
         match queue.do_connect(remote, yielder).await {
-            Ok(()) => (qd, OperationResult::Connect),
+            Ok(addr) => (qd, OperationResult::Connect(addr)),
             Err(e) => {
                 warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);
                 (qd, OperationResult::Failed(e))
@@ -588,12 +589,18 @@ impl DerefMut for SharedCatnapLibOS {
 /// Packs a [OperationResult] into a [demi_qresult_t].
 fn pack_result(rt: &SharedDemiRuntime, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
     match result {
-        OperationResult::Connect => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
+        OperationResult::Connect(local_addr) => {
+            let saddr: SockAddr = socketaddrv4_to_sockaddr(&local_addr);
+            let qr_value: demi_qr_value_t = demi_qr_value_t {
+                cres: demi_connect_result_t { addr: saddr },
+            };
+            demi_qresult_t {
+                qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
+                qr_qd: qd.into(),
+                qr_qt: qt,
+                qr_ret: 0,
+                qr_value,
+            }
         },
         OperationResult::Accept((new_qd, addr)) => {
             let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);

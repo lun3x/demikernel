@@ -40,10 +40,18 @@ pub struct demi_accept_result_t {
     pub addr: SockAddr,
 }
 
+/// Result for `connect()`
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct demi_connect_result_t {
+    pub addr: SockAddr,
+}
+
 #[repr(C)]
 pub union demi_qr_value_t {
     pub sga: demi_sgarray_t,
     pub ares: demi_accept_result_t,
+    pub cres: demi_connect_result_t,
 }
 
 /// Result

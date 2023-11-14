@@ -65,9 +65,9 @@ use socket2::{
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::{
-    WSAEISCONN,
     WSAEALREADY,
     WSAEINPROGRESS,
+    WSAEISCONN,
     WSAEWOULDBLOCK,
 };
 
@@ -388,7 +388,7 @@ impl Socket {
     }
 
     /// Constructs from [self] a socket that is attempting to connect to a remote address.
-    pub fn try_connect(&mut self, remote: SocketAddrV4) -> Result<(), Fail> {
+    pub fn try_connect(&mut self, remote: SocketAddrV4) -> Result<SocketAddrV4, Fail> {
         // Check whether we can connect.
         self.state_machine.may_connect()?;
         self.state_machine.prepare(SocketOp::Connected)?;
@@ -405,10 +405,19 @@ impl Socket {
             } {
                 // Operation completed.
                 stats if stats == 0 => {
+                    let Some(local) = local_addr(self.fd) else {
+                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
+                        let message: String = format!("try_connect(): operation failed (errno={:?})", errno);
+                        if !DemiRuntime::should_retry(errno) {
+                            error!("{}", message);
+                        }
+                        return Err(Fail::new(errno, &message));
+                    };
                     trace!("connection established ({:?})", remote);
                     self.remote = Some(remote);
+                    self.local = Some(local);
                     self.state_machine.commit();
-                    Ok(())
+                    Ok(local)
                 },
                 // Operation not completed, thus parse errno to find out what happened.
                 _ => {
@@ -440,7 +449,11 @@ impl Socket {
                     Ok(())
                 },
                 // Operation not ready yet.
-                Err(e) if e.raw_os_error() == Some(WSAEWOULDBLOCK.0) || e.raw_os_error() == Some(WSAEINPROGRESS.0) || e.raw_os_error() == Some(WSAEALREADY.0) => {
+                Err(e)
+                    if e.raw_os_error() == Some(WSAEWOULDBLOCK.0)
+                        || e.raw_os_error() == Some(WSAEINPROGRESS.0)
+                        || e.raw_os_error() == Some(WSAEALREADY.0) =>
+                {
                     Err(Fail::new(e.raw_os_error().unwrap_or(0), "operation not ready yet"))
                 },
                 // Operation failed.
@@ -695,4 +708,15 @@ impl Socket {
             },
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn local_addr(fd: RawFd) -> Option<SocketAddrV4> {
+    let mut saddr: SockAddr = unsafe { mem::zeroed() };
+    let mut addrlen: Socklen = mem::size_of::<SockAddrIn>() as u32;
+    let errno = unsafe { libc::getsockname(fd, &mut saddr as *mut SockAddr, &mut addrlen as *mut u32) };
+    if errno == -1 {
+        return None;
+    }
+    Some(linux::sockaddr_to_socketaddrv4(&saddr))
 }

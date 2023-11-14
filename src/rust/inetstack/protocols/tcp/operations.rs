@@ -30,7 +30,7 @@ impl<const N: usize> fmt::Debug for ConnectFuture<N> {
 }
 
 impl<const N: usize> Future for ConnectFuture<N> {
-    type Output = Result<(), Fail>;
+    type Output = Result<SocketAddrV4, Fail>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
         let mut peer: SharedTcpPeer<N> = self.peer.clone();

@@ -692,7 +692,7 @@ impl<const N: usize> SharedTcpPeer<N> {
         Ok(())
     }
 
-    pub fn poll_connect_finished(&mut self, qd: QDesc, context: &mut Context) -> Poll<Result<(), Fail>> {
+    pub fn poll_connect_finished(&mut self, qd: QDesc, context: &mut Context) -> Poll<Result<SocketAddrV4, Fail>> {
         let mut queue: SharedTcpQueue<N> = match self.get_shared_queue(&qd) {
             Ok(queue) => queue,
             Err(e) => return Poll::Ready(Err(e)),
@@ -705,6 +705,7 @@ impl<const N: usize> SharedTcpPeer<N> {
                 };
                 match result {
                     Ok(cb) => {
+                        let local = cb.get_local();
                         let new_socket = Socket::Established(
                             match EstablishedSocket::new(cb, qd, self.dead_socket_tx.clone(), self.runtime.clone()) {
                                 Ok(socket) => socket,
@@ -712,7 +713,7 @@ impl<const N: usize> SharedTcpPeer<N> {
                             },
                         );
                         queue.set_socket(new_socket);
-                        Poll::Ready(Ok(()))
+                        Poll::Ready(Ok(local))
                     },
                     Err(fail) => Poll::Ready(Err(fail)),
                 }

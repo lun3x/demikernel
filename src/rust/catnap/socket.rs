@@ -415,7 +415,6 @@ impl Socket {
                     };
                     trace!("connection established ({:?})", remote);
                     self.remote = Some(remote);
-                    self.local = Some(local);
                     self.state_machine.commit();
                     Ok(local)
                 },

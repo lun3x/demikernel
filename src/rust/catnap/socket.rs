@@ -405,14 +405,21 @@ impl Socket {
             } {
                 // Operation completed.
                 stats if stats == 0 => {
-                    let Some(local) = local_addr(self.fd) else {
-                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                        let message: String = format!("try_connect(): operation failed (errno={:?})", errno);
-                        if !DemiRuntime::should_retry(errno) {
-                            error!("{}", message);
+                    let local = {
+                        if let Some(local) = self.local() {
+                            local
+                        } else if let Some(local) = local_addr(self.fd) {
+                            local
+                        } else {
+                            let errno: libc::c_int = unsafe { *libc::__errno_location() };
+                            let message: String = format!("getsockname(): operation failed (errno={:?})", errno);
+                            if !DemiRuntime::should_retry(errno) {
+                                error!("{}", message);
+                            }
+                            return Err(Fail::new(errno, &message));
                         }
-                        return Err(Fail::new(errno, &message));
                     };
+
                     trace!("connection established ({:?})", remote);
                     self.remote = Some(remote);
                     self.state_machine.commit();
@@ -638,8 +645,9 @@ impl Socket {
                 _ => {
                     let errno: libc::c_int = unsafe { *libc::__errno_location() };
                     let message: String = format!("try_pop(): operation failed (errno={:?})", errno);
+
                     if !DemiRuntime::should_retry(errno) {
-                        error!("{}", message);
+                        println!("{}", message);
                     }
                     Err(Fail::new(errno, &message))
                 },

@@ -8,4 +8,4 @@ COPY ../ /code
 
 WORKDIR /code
 
-# RUN make
+#RUN make

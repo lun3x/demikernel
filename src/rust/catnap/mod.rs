@@ -164,11 +164,11 @@ impl SharedCatnapLibOS {
         }
 
         // Check wether the address is in use.
-        // if self.addr_in_use(local) {
-        //     let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
-        //     error!("bind(): {}", &cause);
-        //     return Err(Fail::new(libc::EADDRINUSE, &cause));
-        // }
+        if self.addr_in_use(local) {
+            let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
+            error!("bind(): {}", &cause);
+            return Err(Fail::new(libc::EADDRINUSE, &cause));
+        }
 
         // Issue bind operation.
         self.get_shared_queue(&qd)?.bind(local)

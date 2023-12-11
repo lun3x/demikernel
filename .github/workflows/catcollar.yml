@@ -2,6 +2,9 @@
 # Licensed under the MIT license.
 
 name: Main Catcollar
+concurrency:
+  group: catcollar
+  cancel-in-progress: false
 
 on:
   push:
@@ -13,6 +16,7 @@ on:
       - dev
       - unstable
       - main
+  workflow_dispatch:
 
 env:
   LIBOS: catcollar
@@ -44,10 +48,11 @@ jobs:
         echo -e "\tPort ${{ secrets.PORTNUM }}" >> $HOME/.ssh/config
     - name: Run
       run: |
+        pip install --pre azure-data-tables
         python3 tools/demikernel_ci.py \
           --server $SERVER \
           --client $CLIENT \
-          --repository demikernel/demikernel \
+          --repository demikernel \
           --branch origin/${{ github.ref_name }} \
           --libos $LIBOS \
           --debug \
@@ -85,15 +90,18 @@ jobs:
         echo -e "\tPort ${{ secrets.PORTNUM }}" >> $HOME/.ssh/config
     - name: Run
       run: |
+        pip install --pre azure-data-tables
         python3 tools/demikernel_ci.py \
           --server $SERVER \
           --client $CLIENT \
-          --repository demikernel/demikernel \
+          --repository demikernel \
           --branch origin/${{ github.ref_name }} \
           --libos $LIBOS \
           --test-unit --test-system all --delay 2 \
           --server-addr $SERVER_ADDR \
-          --client-addr $CLIENT_ADDR
+          --client-addr $CLIENT_ADDR \
+          --connection-string "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+          --table-name ${{ secrets.AZURE_STORAGE_TABLE_NAME }}
     - name: Archive Logs
       if: always()
       uses: actions/upload-artifact@v3

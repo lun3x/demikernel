@@ -5,6 +5,7 @@
 // Imports
 //======================================================================================================================
 
+use crate::helper_functions;
 use anyhow::Result;
 use demikernel::{
     demi_sgarray_t,
@@ -21,7 +22,7 @@ use std::{
         HashMap,
         HashSet,
     },
-    net::SocketAddrV4,
+    net::SocketAddr,
 };
 
 //======================================================================================================================
@@ -32,7 +33,7 @@ use std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -60,8 +61,6 @@ pub struct TcpServer {
     clients_accepted: usize,
     /// Number of closed connections.
     clients_closed: usize,
-    /// Governs if the sockets are closed using async_close() or close().
-    should_async_close: bool,
     /// Test passed flag to allow cleanup in drop() only if the test fails.
     has_test_passed: bool,
 }
@@ -72,7 +71,7 @@ pub struct TcpServer {
 
 impl TcpServer {
     /// Creates a new TCP server.
-    pub fn new(mut libos: LibOS, local: SocketAddrV4, should_async_close: bool) -> Result<Self> {
+    pub fn new(mut libos: LibOS, local: SocketAddr) -> Result<Self> {
         // Create TCP socket.
         let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
 
@@ -89,7 +88,6 @@ impl TcpServer {
             qts_reverse: HashMap::default(),
             clients_accepted: 0,
             clients_closed: 0,
-            should_async_close,
             has_test_passed: false,
         });
     }
@@ -156,15 +154,15 @@ impl TcpServer {
                 },
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     let qd: QDesc = qr.qr_qd.into();
-                    let errno: i64 = qr.qr_ret;
 
                     // Ensure that this error was triggered because
                     // the client has terminated the connection.
-                    assert_eq!(
-                        errno,
-                        libc::ECONNRESET as i64,
-                        "client should have had terminated the connection, but it has not"
-                    );
+                    if !helper_functions::is_closed(qr.qr_ret) {
+                        anyhow::bail!(
+                            "client should have had terminated the connection, but it has not: error={:?}",
+                            qr.qr_ret
+                        )
+                    }
 
                     // Handle connection termination.
                     let _: Vec<QToken> = self.handle_connection_termination(qd)?;
@@ -175,10 +173,10 @@ impl TcpServer {
             }
         }
 
-        // If close() fails, this test will fail. That is the desired behavior, because we want to test the close() 
-        // functionality. So this test differs from other tests. Other tests allocate resources in new() and release 
+        // If close() fails, this test will fail. That is the desired behavior, because we want to test the close()
+        // functionality. So this test differs from other tests. Other tests allocate resources in new() and release
         // them in the drop() function only.
-        self.issue_close(self.sockqd)?;
+        helper_functions::close_and_wait(&mut self.libos, self.sockqd)?;
 
         self.has_test_passed = true;
 
@@ -213,7 +211,7 @@ impl TcpServer {
                     let qd: QDesc = unsafe { qr.qr_value.ares.qd.into() };
                     self.clients_accepted += 1;
                     println!("{} clients accepted, closing socket", self.clients_accepted);
-                    self.issue_close(qd)?;
+                    helper_functions::close_and_wait(&mut self.libos, qd)?;
                     self.clients_closed += 1;
                     self.issue_accept()?;
                 },
@@ -224,7 +222,7 @@ impl TcpServer {
         }
 
         // Close local socket.
-        self.issue_close(self.sockqd)?;
+        helper_functions::close_and_wait(&mut self.libos, self.sockqd)?;
 
         Ok(())
     }
@@ -249,8 +247,8 @@ impl TcpServer {
 
     /// Cancels all pending operations of a given connection.
     fn cancel_pending_operations(&mut self, qd: QDesc) -> Vec<QToken> {
-        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.drain_filter(|_k, v| *v == qd).collect();
-        let qts_dropped: Vec<QToken> = self.qts.drain_filter(|x| qts_drained.contains_key(x)).collect();
+        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.extract_if(|_k, v| *v == qd).collect();
+        let qts_dropped: Vec<QToken> = self.qts.extract_if(|x| qts_drained.contains_key(x)).collect();
         qts_dropped
     }
 
@@ -279,28 +277,6 @@ impl TcpServer {
         Ok(())
     }
 
-    /// Issues a close() operation.
-    fn issue_close(&mut self, qd: QDesc) -> Result<()> {
-        if self.should_async_close {
-            let qt: QToken = self.libos.async_close(qd)?;
-
-            match self.libos.wait(qt, None) {
-                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_CLOSE && qr.qr_ret == 0 => Ok(()),
-                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECONNRESET as i64 => {
-                    Ok(())
-                },
-                Ok(_) => anyhow::bail!("wait() should succeed with async_close()"),
-                Err(_) => anyhow::bail!("wait() should succeed with async_close()"),
-            }
-        } else {
-            match self.libos.close(qd) {
-                Ok(_) => Ok(()),
-                Err(e) if e.errno == libc::ECONNRESET => Ok(()),
-                Err(_) => anyhow::bail!("wait() should succeed with close()"),
-            }
-        }
-    }
-
     /// Handles the completion of an accept() operation.
     fn handle_connection_establishment(&mut self, qd: QDesc) -> Result<()> {
         // Register client.
@@ -324,7 +300,7 @@ impl TcpServer {
         self.unregister_client(qd);
 
         // Close TCP socket.
-        self.issue_close(qd)?;
+        helper_functions::close_and_wait(&mut self.libos, qd)?;
 
         self.clients_closed += 1;
         println!("{} clients closed", self.clients_closed);
@@ -344,13 +320,15 @@ impl Drop for TcpServer {
         if self.has_test_passed {
             return;
         }
+        // Close all client sockets.
         for qd in self.clients.clone().drain() {
-            if let Err(e) = self.issue_close(qd) {
+            if let Err(e) = helper_functions::close_and_wait(&mut self.libos, qd) {
                 println!("ERROR: close() failed (error={:?}", e);
                 println!("WARN: leaking qd={:?}", qd);
             }
         }
-        if let Err(e) = self.libos.close(self.sockqd) {
+        // Close local socket.
+        if let Err(e) = helper_functions::close_and_wait(&mut self.libos, self.sockqd) {
             println!("ERROR: close() failed (error={:?}", e);
             println!("WARN: leaking qd={:?}", self.sockqd);
         }

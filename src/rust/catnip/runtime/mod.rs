@@ -57,7 +57,7 @@ use crate::runtime::{
         },
         types::MacAddress,
     },
-    Runtime,
+    SharedObject,
 };
 use ::anyhow::{
     bail,
@@ -69,6 +69,10 @@ use ::std::{
     ffi::CString,
     mem::MaybeUninit,
     net::Ipv4Addr,
+    ops::{
+        Deref,
+        DerefMut,
+    },
     time::Duration,
 };
 
@@ -92,23 +96,25 @@ macro_rules! expect_zero {
 //==============================================================================
 
 /// DPDK Runtime
-#[derive(Clone)]
 pub struct DPDKRuntime {
     mm: MemoryManager,
     port_id: u16,
-    pub link_addr: MacAddress,
-    pub ipv4_addr: Ipv4Addr,
-    pub arp_options: ArpConfig,
-    pub tcp_options: TcpConfig,
-    pub udp_options: UdpConfig,
+    link_addr: MacAddress,
+    ipv4_addr: Ipv4Addr,
+    arp_config: ArpConfig,
+    tcp_config: TcpConfig,
+    udp_config: UdpConfig,
 }
+
+#[derive(Clone)]
+pub struct SharedDPDKRuntime(SharedObject<DPDKRuntime>);
 
 //==============================================================================
 // Associate Functions
 //==============================================================================
 
 /// Associate Functions for DPDK Runtime
-impl DPDKRuntime {
+impl SharedDPDKRuntime {
     pub fn new(
         ipv4_addr: Ipv4Addr,
         eal_init_args: &[CString],
@@ -119,7 +125,7 @@ impl DPDKRuntime {
         mss: usize,
         tcp_checksum_offload: bool,
         udp_checksum_offload: bool,
-    ) -> DPDKRuntime {
+    ) -> Self {
         let (mm, port_id, link_addr) = Self::initialize_dpdk(
             eal_init_args,
             use_jumbo_frames,
@@ -129,7 +135,7 @@ impl DPDKRuntime {
         )
         .unwrap();
 
-        let arp_options = ArpConfig::new(
+        let arp_config = ArpConfig::new(
             Some(Duration::from_secs(15)),
             Some(Duration::from_secs(20)),
             Some(5),
@@ -137,7 +143,7 @@ impl DPDKRuntime {
             Some(disable_arp),
         );
 
-        let tcp_options = TcpConfig::new(
+        let tcp_config = TcpConfig::new(
             Some(mss),
             None,
             None,
@@ -148,17 +154,17 @@ impl DPDKRuntime {
             Some(tcp_checksum_offload),
         );
 
-        let udp_options = UdpConfig::new(Some(udp_checksum_offload), Some(udp_checksum_offload));
+        let udp_config = UdpConfig::new(Some(udp_checksum_offload), Some(udp_checksum_offload));
 
-        Self {
+        Self(SharedObject::<DPDKRuntime>::new(DPDKRuntime {
             mm,
             port_id,
             link_addr,
             ipv4_addr,
-            arp_options,
-            tcp_options,
-            udp_options,
-        }
+            arp_config,
+            tcp_config,
+            udp_config,
+        }))
     }
 
     /// Initializes DPDK.
@@ -366,10 +372,42 @@ impl DPDKRuntime {
 
         Ok(())
     }
+
+    pub fn get_link_addr(&self) -> MacAddress {
+        self.link_addr
+    }
+
+    pub fn get_ip_addr(&self) -> Ipv4Addr {
+        self.ipv4_addr
+    }
+
+    pub fn get_arp_config(&self) -> ArpConfig {
+        self.arp_config.clone()
+    }
+
+    pub fn get_udp_config(&self) -> UdpConfig {
+        self.udp_config.clone()
+    }
+
+    pub fn get_tcp_config(&self) -> TcpConfig {
+        self.tcp_config.clone()
+    }
 }
 
 //==============================================================================
 // Trait Implementations
 //==============================================================================
 
-impl Runtime for DPDKRuntime {}
+impl Deref for SharedDPDKRuntime {
+    type Target = DPDKRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl DerefMut for SharedDPDKRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}

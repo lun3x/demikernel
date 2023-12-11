@@ -10,7 +10,7 @@ use ::demikernel::{
     LibOS,
     QDesc,
 };
-use ::std::net::SocketAddrV4;
+use ::std::net::SocketAddr;
 
 //======================================================================================================================
 // Constants
@@ -20,7 +20,7 @@ use ::std::net::SocketAddrV4;
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -33,7 +33,7 @@ pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
 //======================================================================================================================
 
 /// Drives integration tests for close() on TCP sockets.
-pub fn run(libos: &mut LibOS, addr: &SocketAddrV4) -> Vec<(String, String, Result<(), anyhow::Error>)> {
+pub fn run(libos: &mut LibOS, addr: &SocketAddr) -> Vec<(String, String, Result<(), anyhow::Error>)> {
     let mut result: Vec<(String, String, Result<(), anyhow::Error>)> = Vec::new();
 
     crate::collect!(result, crate::test!(close_invalid_queue_descriptor(libos)));
@@ -83,7 +83,7 @@ fn close_unbound_socket(libos: &mut LibOS) -> Result<()> {
 }
 
 /// Attempts to close a TCP socket that is bound.
-fn close_bound_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn close_bound_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a bound socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, *local)?;
@@ -95,7 +95,7 @@ fn close_bound_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
 }
 
 /// Attempts to close a TCP socket that is listening.
-fn close_listening_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn close_listening_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a listening socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, *local)?;

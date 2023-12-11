@@ -5,21 +5,19 @@
 // Imports
 //======================================================================================================================
 
-use crate::{
-    runtime::{
-        fail::Fail,
-        types::{
-            demi_qresult_t,
-            demi_sgarray_t,
-        },
-        QDesc,
-        QToken,
-    },
+use crate::runtime::{
+    fail::Fail,
     scheduler::TaskHandle,
+    types::{
+        demi_qresult_t,
+        demi_sgarray_t,
+    },
+    QDesc,
+    QToken,
 };
 
 #[cfg(feature = "catmem-libos")]
-use crate::catmem::CatmemLibOS;
+use crate::catmem::SharedCatmemLibOS;
 
 //======================================================================================================================
 // Structures
@@ -28,7 +26,7 @@ use crate::catmem::CatmemLibOS;
 /// Associated functions for Memory LibOSes.
 pub enum MemoryLibOS {
     #[cfg(feature = "catmem-libos")]
-    Catmem(CatmemLibOS),
+    Catmem(SharedCatmemLibOS),
 }
 
 //======================================================================================================================
@@ -37,7 +35,7 @@ pub enum MemoryLibOS {
 
 /// Associated functions for memory LibOSes
 impl MemoryLibOS {
-    /// Creates a memory queue.
+    /// Creates a memory queue and connects to the consumer/pop-only end.
     #[allow(unreachable_patterns, unused_variables)]
     pub fn create_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         match self {
@@ -47,7 +45,7 @@ impl MemoryLibOS {
         }
     }
 
-    /// Opens an existing memory queue.
+    /// Opens an existing memory queue and connects to the producer/push-only end.
     #[allow(unreachable_patterns, unused_variables)]
     pub fn open_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         match self {
@@ -102,7 +100,7 @@ impl MemoryLibOS {
     pub fn sgaalloc(&self, size: usize) -> Result<demi_sgarray_t, Fail> {
         match self {
             #[cfg(feature = "catmem-libos")]
-            MemoryLibOS::Catmem(libos) => libos.alloc_sgarray(size),
+            MemoryLibOS::Catmem(libos) => libos.sgaalloc(size),
             _ => unreachable!("unknown memory libos"),
         }
     }
@@ -112,7 +110,7 @@ impl MemoryLibOS {
     pub fn sgafree(&self, sga: demi_sgarray_t) -> Result<(), Fail> {
         match self {
             #[cfg(feature = "catmem-libos")]
-            MemoryLibOS::Catmem(libos) => libos.free_sgarray(sga),
+            MemoryLibOS::Catmem(libos) => libos.sgafree(sga),
             _ => unreachable!("unknown memory libos"),
         }
     }

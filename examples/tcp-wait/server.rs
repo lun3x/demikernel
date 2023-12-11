@@ -21,7 +21,7 @@ use ::std::{
         HashMap,
         HashSet,
     },
-    net::SocketAddrV4,
+    net::SocketAddr,
 };
 
 //======================================================================================================================
@@ -32,7 +32,7 @@ use ::std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -68,7 +68,7 @@ pub struct TcpServer {
 //======================================================================================================================
 
 impl TcpServer {
-    pub fn new(mut libos: LibOS, local: SocketAddrV4, nclients: usize) -> Result<Self> {
+    pub fn new(mut libos: LibOS, local: SocketAddr, nclients: usize) -> Result<Self> {
         // Create TCP socket.
         let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
 
@@ -140,7 +140,7 @@ impl TcpServer {
                         "client should not have any pending operations, but it has"
                     );
                 },
-                demi_opcode_t::DEMI_OPC_FAILED if qr.qr_ret == libc::ECONNRESET as i64 => {
+                demi_opcode_t::DEMI_OPC_FAILED if is_closed(qr.qr_ret) => {
                     let qd: QDesc = qr.qr_qd.into();
                     let _: Vec<QToken> = self.terminate_connection(qd)?;
                 },
@@ -176,8 +176,8 @@ impl TcpServer {
     }
 
     fn cancel_pending_operations(&mut self, qd: QDesc) -> Vec<QToken> {
-        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.drain_filter(|_k, v| *v == qd).collect();
-        let qts_dropped: Vec<QToken> = self.qts.drain_filter(|x| qts_drained.contains_key(x)).collect();
+        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.extract_if(|_k, v| *v == qd).collect();
+        let qts_dropped: Vec<QToken> = self.qts.extract_if(|x| qts_drained.contains_key(x)).collect();
         qts_dropped
     }
 
@@ -230,6 +230,17 @@ impl TcpServer {
         self.clients_closed += 1;
         println!("{} clients closed", self.clients_closed);
         Ok(qts_cancelled)
+    }
+}
+
+//======================================================================================================================
+// Standalone functions
+//======================================================================================================================
+
+fn is_closed(ret: i64) -> bool {
+    match ret as i32 {
+        libc::ECONNRESET | libc::ENOTCONN | libc::ECANCELED | libc::EBADF => true,
+        _ => false,
     }
 }
 

@@ -16,7 +16,7 @@ use ::demikernel::{
 };
 use ::std::{
     env,
-    net::SocketAddrV4,
+    net::SocketAddr,
     slice,
     str::FromStr,
 };
@@ -29,7 +29,7 @@ use log::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -133,7 +133,7 @@ impl TcpServer {
         });
     }
 
-    pub fn run(&mut self, local: SocketAddrV4, fill_char: u8, buffer_size: usize) -> Result<()> {
+    pub fn run(&mut self, local: SocketAddr, fill_char: u8, buffer_size: usize) -> Result<()> {
         let nbytes: usize = buffer_size * 1024;
 
         if let Err(e) = self.libos.bind(self.sockqd, local) {
@@ -242,7 +242,7 @@ impl TcpClient {
         });
     }
 
-    pub fn run(&mut self, remote: SocketAddrV4, fill_char: u8, buffer_size: usize) -> Result<()> {
+    pub fn run(&mut self, remote: SocketAddr, fill_char: u8, buffer_size: usize) -> Result<()> {
         let nbytes: usize = buffer_size * 1024;
 
         let qt: QToken = match self.libos.connect(self.sockqd, remote) {
@@ -336,7 +336,7 @@ pub fn main() -> Result<()> {
             Ok(libos) => libos,
             Err(e) => anyhow::bail!("failed to initialize libos: {:?}", e.cause),
         };
-        let sockaddr: SocketAddrV4 = SocketAddrV4::from_str(&args[2])?;
+        let sockaddr: SocketAddr = SocketAddr::from_str(&args[2])?;
 
         if args[1] == "--server" {
             let mut server: TcpServer = TcpServer::new(libos)?;

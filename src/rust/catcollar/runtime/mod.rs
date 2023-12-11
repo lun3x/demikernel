@@ -20,19 +20,21 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
-        Runtime,
+        scheduler::Scheduler,
+        SharedObject,
     },
-    scheduler::scheduler::Scheduler,
 };
 use ::std::{
-    cell::RefCell,
     collections::{
         HashMap,
         HashSet,
     },
     net::SocketAddrV4,
+    ops::{
+        Deref,
+        DerefMut,
+    },
     os::unix::prelude::RawFd,
-    rc::Rc,
 };
 
 //==============================================================================
@@ -51,38 +53,29 @@ const CATCOLLAR_NUM_RINGS: u32 = 128;
 pub struct RequestId(pub *const liburing::msghdr);
 
 /// I/O User Ring Runtime
-#[derive(Clone)]
 pub struct IoUringRuntime {
     /// Scheduler
     pub scheduler: Scheduler,
     /// Underlying io_uring.
-    io_uring: Rc<RefCell<IoUring>>,
+    io_uring: IoUring,
     /// Pending requests.
     pending: HashSet<RequestId>,
     /// Completed requests.
     completed: HashMap<RequestId, (Option<SocketAddrV4>, i32)>,
 }
 
+#[derive(Clone)]
+pub struct SharedIoUringRuntime(SharedObject<IoUringRuntime>);
+
 //==============================================================================
 // Associate Functions
 //==============================================================================
 
 /// Associate Functions for I/O User Ring Runtime
-impl IoUringRuntime {
-    /// Creates an I/O user ring runtime.
-    pub fn new() -> Self {
-        let io_uring: IoUring = IoUring::new(CATCOLLAR_NUM_RINGS).expect("cannot create io_uring");
-        Self {
-            scheduler: Scheduler::default(),
-            io_uring: Rc::new(RefCell::new(io_uring)),
-            pending: HashSet::new(),
-            completed: HashMap::new(),
-        }
-    }
-
+impl SharedIoUringRuntime {
     /// Pushes a buffer to the target I/O user ring.
     pub fn push(&mut self, sockfd: RawFd, buf: DemiBuffer) -> Result<RequestId, Fail> {
-        let msg_ptr: *const liburing::msghdr = self.io_uring.borrow_mut().push(sockfd, buf)?;
+        let msg_ptr: *const liburing::msghdr = self.io_uring.push(sockfd, buf)?;
         let request_id: RequestId = RequestId(msg_ptr);
         self.pending.insert(request_id);
         Ok(request_id)
@@ -90,7 +83,7 @@ impl IoUringRuntime {
 
     /// Pushes a buffer to the target I/O user ring.
     pub fn pushto(&mut self, sockfd: i32, addr: SocketAddrV4, buf: DemiBuffer) -> Result<RequestId, Fail> {
-        let msg_ptr: *const liburing::msghdr = self.io_uring.borrow_mut().pushto(sockfd, addr, buf)?;
+        let msg_ptr: *const liburing::msghdr = self.io_uring.pushto(sockfd, addr, buf)?;
         let request_id: RequestId = RequestId(msg_ptr);
         self.pending.insert(request_id);
         Ok(request_id)
@@ -98,7 +91,7 @@ impl IoUringRuntime {
 
     /// Pops a buffer from the target I/O user ring.
     pub fn pop(&mut self, sockfd: RawFd, buf: DemiBuffer) -> Result<RequestId, Fail> {
-        let msg_ptr: *const liburing::msghdr = self.io_uring.borrow_mut().pop(sockfd, buf)?;
+        let msg_ptr: *const liburing::msghdr = self.io_uring.pop(sockfd, buf)?;
         let request_id: RequestId = RequestId(msg_ptr);
         self.pending.insert(request_id);
         Ok(request_id)
@@ -113,7 +106,7 @@ impl IoUringRuntime {
             // The target request may not be completed.
             None => {
                 // Peek the underlying io_uring.
-                match self.io_uring.borrow_mut().wait() {
+                match self.io_uring.wait() {
                     // Some operation has completed.
                     Ok((other_request_id, size)) => {
                         let msg: Box<liburing::msghdr> = unsafe { Box::from_raw(other_request_id) };
@@ -153,5 +146,29 @@ impl IoUringRuntime {
 /// Memory Runtime Trait Implementation for IoUring Runtime
 impl MemoryRuntime for IoUringRuntime {}
 
-/// Runtime Trait Implementation for I/O User Ring Runtime
-impl Runtime for IoUringRuntime {}
+impl Default for SharedIoUringRuntime {
+    /// Creates an I/O user ring runtime.
+    fn default() -> Self {
+        let io_uring: IoUring = IoUring::new(CATCOLLAR_NUM_RINGS).expect("cannot create io_uring");
+        Self(SharedObject::<IoUringRuntime>::new(IoUringRuntime {
+            scheduler: Scheduler::default(),
+            io_uring: io_uring,
+            pending: HashSet::new(),
+            completed: HashMap::new(),
+        }))
+    }
+}
+
+impl Deref for SharedIoUringRuntime {
+    type Target = IoUringRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl DerefMut for SharedIoUringRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}

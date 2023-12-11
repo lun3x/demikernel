@@ -5,9 +5,9 @@
 // Imports
 //==============================================================================
 
-use super::runtime::DummyRuntime;
+use super::runtime::SharedDummyRuntime;
 use ::demikernel::{
-    inetstack::InetStack,
+    inetstack::SharedInetStack,
     runtime::{
         fail::Fail,
         logging,
@@ -19,26 +19,21 @@ use ::demikernel::{
                 UdpConfig,
             },
             types::MacAddress,
+            NetworkRuntime,
         },
-        timer::TimerRc,
+        SharedBox,
+        SharedDemiRuntime,
     },
 };
 use crossbeam_channel::{
     Receiver,
     Sender,
 };
-use demikernel::{
-    runtime::network::consts::RECEIVE_BATCH_SIZE,
-    scheduler::scheduler::Scheduler,
-};
+use demikernel::runtime::network::consts::RECEIVE_BATCH_SIZE;
 use std::{
     collections::HashMap,
     net::Ipv4Addr,
-    rc::Rc,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Duration,
 };
 
 //==============================================================================
@@ -59,10 +54,10 @@ impl DummyLibOS {
         tx: Sender<DemiBuffer>,
         rx: Receiver<DemiBuffer>,
         arp: HashMap<Ipv4Addr, MacAddress>,
-    ) -> Result<InetStack<RECEIVE_BATCH_SIZE>, Fail> {
-        let now: Instant = Instant::now();
-        let rt: Rc<DummyRuntime> = Rc::new(DummyRuntime::new(now, rx, tx));
-        let arp_options: ArpConfig = ArpConfig::new(
+    ) -> Result<SharedInetStack<RECEIVE_BATCH_SIZE>, Fail> {
+        let runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+        let transport: SharedDummyRuntime = SharedDummyRuntime::new(rx, tx);
+        let arp_config: ArpConfig = ArpConfig::new(
             Some(Duration::from_secs(600)),
             Some(Duration::from_secs(1)),
             Some(2),
@@ -71,20 +66,17 @@ impl DummyLibOS {
         );
         let udp_config: UdpConfig = UdpConfig::default();
         let tcp_config: TcpConfig = TcpConfig::default();
-        let scheduler: Scheduler = rt.scheduler.clone();
-        let clock: TimerRc = rt.clock.clone();
         let rng_seed: [u8; 32] = [0; 32];
         logging::initialize();
-        InetStack::new(
-            rt,
-            scheduler,
-            clock,
+        SharedInetStack::new(
+            runtime,
+            SharedBox::<dyn NetworkRuntime<RECEIVE_BATCH_SIZE>>::new(Box::new(transport)),
             link_addr,
             ipv4_addr,
             udp_config,
             tcp_config,
             rng_seed,
-            arp_options,
+            arp_config,
         )
     }
 

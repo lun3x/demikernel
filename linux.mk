@@ -31,6 +31,7 @@ export BUILD_DIR := $(CURDIR)/target/release
 ifeq ($(BUILD),dev)
 export BUILD_DIR := $(CURDIR)/target/debug
 endif
+export INPUT_DIR ?= $(CURDIR)/nettest/input
 
 #=======================================================================================================================
 # Toolchain Configuration
@@ -56,7 +57,7 @@ export CARGO_FEATURES := --features=$(LIBOS)-libos
 
 # Switch for DPDK
 ifeq ($(LIBOS),catnip)
-DRIVER ?= $(shell [ ! -z "`lspci | grep -E "ConnectX-[4,5]"`" ] && echo mlx5 || echo mlx4)
+DRIVER ?= $(shell [ ! -z "`lspci | grep -E "ConnectX-[4,5,6]"`" ] && echo mlx5 || echo mlx4)
 CARGO_FEATURES += --features=$(DRIVER)
 endif
 

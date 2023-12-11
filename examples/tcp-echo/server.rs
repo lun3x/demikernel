@@ -21,7 +21,7 @@ use std::{
         HashMap,
         HashSet,
     },
-    net::SocketAddrV4,
+    net::SocketAddr,
     time::{
         Duration,
         Instant,
@@ -32,7 +32,7 @@ use std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -64,7 +64,7 @@ pub struct TcpEchoServer {
 
 impl TcpEchoServer {
     /// Instantiates a new TCP echo server.
-    pub fn new(mut libos: LibOS, local: SocketAddrV4) -> Result<Self> {
+    pub fn new(mut libos: LibOS, local: SocketAddr) -> Result<Self> {
         // Create a TCP socket.
         let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
 
@@ -172,8 +172,7 @@ impl TcpEchoServer {
         let errno: i64 = qr.qr_ret;
 
         // Check if client has reset the connection.
-        if errno == libc::ECONNRESET as i64 {
-            println!("INFO: client reset connection (qd={:?})", qd);
+        if is_closed(errno) {
             self.handle_close(qd)?;
         } else {
             println!(
@@ -242,8 +241,8 @@ impl TcpEchoServer {
 
     /// Handles a close operation.
     fn handle_close(&mut self, qd: QDesc) -> Result<()> {
-        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.drain_filter(|_k, v| v == &qd).collect();
-        let _: Vec<_> = self.qts.drain_filter(|x| qts_drained.contains_key(x)).collect();
+        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.extract_if(|_k, v| v == &qd).collect();
+        let _: Vec<_> = self.qts.extract_if(|x| qts_drained.contains_key(x)).collect();
         self.clients.remove(&qd);
         self.libos.close(qd)?;
         Ok(())
@@ -262,6 +261,17 @@ impl TcpEchoServer {
             .remove(&qt)
             .ok_or(anyhow::anyhow!("unregistered queue token"))?;
         Ok(())
+    }
+}
+
+//======================================================================================================================
+// Standalone functions
+//======================================================================================================================
+
+fn is_closed(ret: i64) -> bool {
+    match ret as i32 {
+        libc::ECONNRESET | libc::ENOTCONN | libc::ECANCELED | libc::EBADF => true,
+        _ => false,
     }
 }
 

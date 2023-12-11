@@ -8,16 +8,13 @@ use crate::{
     inetstack::collections::HashTtlCache,
     runtime::{
         network::types::MacAddress,
-        timer::TimerRc,
+        timer::SharedTimer,
     },
 };
 use ::std::{
     collections::HashMap,
     net::Ipv4Addr,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Duration,
 };
 
 //==============================================================================
@@ -56,7 +53,7 @@ pub struct ArpCache {
 impl ArpCache {
     /// Creates an ARP Cache.
     pub fn new(
-        clock: TimerRc,
+        clock: SharedTimer,
         default_ttl: Option<Duration>,
         values: Option<&HashMap<Ipv4Addr, MacAddress>>,
         disable: bool,
@@ -89,11 +86,6 @@ impl ArpCache {
         } else {
             self.cache.get(&ipv4_addr).map(|r| &r.link_addr)
         }
-    }
-
-    /// Advances internal clock of the ARP Cache.
-    pub fn advance_clock(&mut self, now: Instant) {
-        self.cache.advance_clock(now)
     }
 
     /// Clears the ARP cache.

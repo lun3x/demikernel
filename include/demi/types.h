@@ -34,22 +34,40 @@ extern "C"
     /**
      * @brief A segment of a scatter-gather array.
      */
+    #ifdef _WIN32
+    #pragma pack(push, 1)
+    typedef struct demi_sgaseg
+    #endif
+    #ifdef __linux__
     typedef struct __attribute__((__packed__)) demi_sgaseg
+    #endif
     {
         void *sgaseg_buf;    /**< Underlying data.       */
         uint32_t sgaseg_len; /**< Size in bytes of data. */
     } demi_sgaseg_t;
+    #ifdef _WIN32
+    #pragma pack(pop)
+    #endif
 
     /**
      * @brief A scatter-gather array.
      */
+    #ifdef _WIN32
+    #pragma pack(push, 1)
+    typedef struct demi_sgarray
+    #endif
+    #ifdef __linux__
     typedef struct __attribute__((__packed__)) demi_sgarray
+    #endif
     {
         void *sga_buf;                                /**< Reserved.                                       */
         uint32_t sga_numsegs;                         /**< Number of segments in the scatter-gather array. */
         demi_sgaseg_t sga_segs[DEMI_SGARRAY_MAXSIZE]; /**< Scatter-gather array segments.                  */
         struct sockaddr_in sga_addr;                  /**< Source address of scatter-gather array.         */
     } demi_sgarray_t;
+    #ifdef _WIN32
+    #pragma pack(pop)
+    #endif
 
     /**
      * @brief Opcodes for an asynchronous I/O operation.
@@ -68,16 +86,31 @@ extern "C"
     /**
      * @brief Result value for an accept operation.
      */
+    #ifdef _WIN32
+    #pragma pack(push, 1)
+    typedef struct demi_accept_result
+    #endif
+    #ifdef __linux__
     typedef struct __attribute__((__packed__)) demi_accept_result
+    #endif
     {
         int32_t qd;                  /**< Socket I/O queue descriptor of accepted connection. */
         struct sockaddr_in addr; /**< Remote address of accepted connection.              */
     } demi_accept_result_t;
+    #ifdef _WIN32
+    #pragma pack(pop)
+    #endif
 
     /**
      * @brief Result value for an asynchronous I/O operation.
      */
+    #ifdef _WIN32
+    #pragma pack(push, 1)
+    typedef struct demi_qresult
+    #endif
+    #ifdef __linux__
     typedef struct __attribute__((__packed__)) demi_qresult
+    #endif
     {
         enum demi_opcode qr_opcode; /**< Opcode of completed operation.                              */
         int32_t qr_qd;              /**< I/O queue descriptor associated to the completed operation. */
@@ -93,7 +126,9 @@ extern "C"
             demi_accept_result_t ares; /**< Accept result.                      */
         } qr_value;
     } demi_qresult_t;
-
+    #ifdef _WIN32
+    #pragma pack(pop)
+    #endif
 #ifdef __cplusplus
 }
 #endif

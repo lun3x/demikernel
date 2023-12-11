@@ -5,158 +5,166 @@
 // Imports
 //======================================================================================================================
 
-use crate::runtime::{
-    fail::Fail,
-    memory::DemiBuffer,
-    queue::IoQueue,
-};
-use ::futures::{
-    channel::mpsc::{
-        self,
-        Receiver,
-        Sender,
+use crate::{
+    collections::async_queue::AsyncQueue,
+    inetstack::protocols::{
+        arp::SharedArpPeer,
+        ethernet2::{
+            EtherType2,
+            Ethernet2Header,
+        },
+        ip::IpProtocol,
+        ipv4::Ipv4Header,
+        udp::{
+            datagram::UdpDatagram,
+            UdpHeader,
+        },
     },
-    StreamExt,
+    runtime::{
+        fail::Fail,
+        memory::DemiBuffer,
+        network::{
+            types::MacAddress,
+            NetworkRuntime,
+        },
+        queue::{
+            IoQueue,
+            NetworkQueue,
+        },
+        scheduler::Yielder,
+        SharedBox,
+        SharedObject,
+    },
 };
-use ::libc::EIO;
 use ::std::{
-    cell::RefCell,
-    net::SocketAddrV4,
-    rc::Rc,
+    any::Any,
+    net::{
+        Ipv4Addr,
+        SocketAddrV4,
+    },
+    ops::{
+        Deref,
+        DerefMut,
+    },
 };
+
+//======================================================================================================================
+// Constants
+//======================================================================================================================
+
+// Maximum size for receive queues (in messages).
+// TODO: Support max size on async queues.
+#[allow(dead_code)]
+const RECV_QUEUE_MAX_SIZE: usize = 1024;
+
+// Maximum size for send queues (in messages).
+// TODO: Support max size on async queues.
+#[allow(dead_code)]
+const SEND_QUEUE_MAX_SIZE: usize = 1024;
 
 //======================================================================================================================
 // Structures
 //======================================================================================================================
 
-/// Shared Queue Slot
-pub struct SharedQueueSlot<T> {
-    /// Local endpoint.
-    pub local: SocketAddrV4,
-    /// Remote endpoint.
-    pub remote: SocketAddrV4,
-    /// Associated data.
-    pub data: T,
-}
-
-/// Shared Queue
-///
-/// TODO: Reuse this structure in TCP stack, for send/receive queues.
-/// TODO: This should be byte-oriented, not buffer-oriented.
-pub struct SharedQueue<T> {
-    /// Send-side endpoint.
-    tx: Rc<RefCell<Sender<T>>>,
-    /// Receive-side endpoint.
-    rx: Rc<RefCell<Receiver<T>>>,
-    /// Length of shared queue.
-    length: Rc<RefCell<usize>>,
-    /// Capacity of shared queue.
-    capacity: usize,
-}
-
 /// Per-queue metadata for a UDP socket.
-pub struct UdpQueue {
-    addr: Option<SocketAddrV4>,
-    recv_queue: Option<SharedQueue<SharedQueueSlot<DemiBuffer>>>,
+pub struct UdpQueue<const N: usize> {
+    local_ipv4_addr: Ipv4Addr,
+    bound: Option<SocketAddrV4>,
+    local_link_addr: MacAddress,
+    transport: SharedBox<dyn NetworkRuntime<N>>,
+    // A queue of incoming packets as remote address and data buffer pairs.
+    recv_queue: AsyncQueue<(SocketAddrV4, DemiBuffer)>,
+    arp: SharedArpPeer<N>,
+    checksum_offload: bool,
 }
+#[derive(Clone)]
+pub struct SharedUdpQueue<const N: usize>(SharedObject<UdpQueue<N>>);
 
 //======================================================================================================================
 // Associated Functions
 //======================================================================================================================
 
-/// Associated Functions Shared Queues
-impl<T> SharedQueue<T> {
-    /// Instantiates a shared queue.
-    pub fn new(size: usize) -> Self {
-        let (tx, rx): (Sender<T>, Receiver<T>) = mpsc::channel(size);
-        Self {
-            tx: Rc::new(RefCell::new(tx)),
-            rx: Rc::new(RefCell::new(rx)),
-            length: Rc::new(RefCell::new(0)),
-            capacity: size,
-        }
+impl<const N: usize> SharedUdpQueue<N> {
+    pub fn new(
+        local_ipv4_addr: Ipv4Addr,
+        local_link_addr: MacAddress,
+        transport: SharedBox<dyn NetworkRuntime<N>>,
+        arp: SharedArpPeer<N>,
+        checksum_offload: bool,
+    ) -> Result<Self, Fail> {
+        Ok(Self(SharedObject::new(UdpQueue {
+            local_ipv4_addr,
+            bound: None,
+            local_link_addr,
+            transport,
+            recv_queue: AsyncQueue::<(SocketAddrV4, DemiBuffer)>::default(),
+            arp,
+            checksum_offload,
+        })))
     }
 
-    /// Pushes a message to the target shared queue.
-    #[allow(unused_must_use)]
-    pub fn push(&self, msg: T) -> Result<(), Fail> {
-        if *self.length.borrow() == self.capacity {
-            while *self.length.borrow() >= self.capacity / 2 {
-                self.try_pop();
+    pub fn bind(&mut self, local: SocketAddrV4) -> Result<(), Fail> {
+        self.bound = Some(local);
+        Ok(())
+    }
+
+    /// Close this UDP queue and release its resources
+    pub fn close(&mut self) -> Result<(), Fail> {
+        Ok(())
+    }
+
+    pub async fn pushto(&mut self, remote: SocketAddrV4, buf: DemiBuffer, yielder: Yielder) -> Result<(), Fail> {
+        // Check that the socket is bound.
+        let port: u16 = if let Some(addr) = self.local() {
+            addr.port()
+        } else {
+            let cause: String = format!("queue is not bound");
+            error!("pushto(): {}", &cause);
+            return Err(Fail::new(libc::ENOTSUP, &cause));
+        };
+        let remote_link_addr: MacAddress = self.arp.query(remote.ip().clone(), &yielder).await?;
+        let udp_header: UdpHeader = UdpHeader::new(port, remote.port());
+        debug!("UDP send {:?}", udp_header);
+        let datagram = UdpDatagram::new(
+            Ethernet2Header::new(remote_link_addr, self.local_link_addr, EtherType2::Ipv4),
+            Ipv4Header::new(self.local_ipv4_addr, remote.ip().clone(), IpProtocol::UDP),
+            udp_header,
+            buf,
+            self.checksum_offload,
+        );
+        self.transport.transmit(Box::new(datagram));
+        Ok(())
+    }
+
+    pub async fn pop(&mut self, size: Option<usize>, yielder: Yielder) -> Result<(SocketAddrV4, DemiBuffer), Fail> {
+        const MAX_POP_SIZE: usize = 9000;
+        let size: usize = size.unwrap_or(MAX_POP_SIZE);
+
+        loop {
+            match self.recv_queue.pop(&yielder).await {
+                Ok(msg) => {
+                    let remote: SocketAddrV4 = msg.0;
+                    let mut buf: DemiBuffer = msg.1;
+                    // We got more bytes than expected, so we trim the buffer.
+                    if size < buf.len() {
+                        buf.trim(size - buf.len())?;
+                    };
+                    return Ok((remote, buf));
+                },
+                Err(e) => return Err(e),
             }
         }
-
-        match self.tx.borrow_mut().try_send(msg) {
-            Ok(_) => {
-                *self.length.borrow_mut() += 1;
-                Ok(())
-            },
-            Err(_) => Err(Fail::new(EIO, "failed to push to shared queue")),
-        }
     }
 
-    /// Synchronously attempts to pop a message from the target shared queue.
-    pub fn try_pop(&self) -> Result<Option<T>, Fail> {
-        match self.rx.borrow_mut().try_next() {
-            Ok(Some(msg)) => {
-                *self.length.borrow_mut() -= 1;
-                Ok(Some(msg))
-            },
-            Ok(None) => Err(Fail::new(EIO, "failed to pop from shared queue")),
-            Err(_) => Ok(None),
-        }
+    pub fn receive(&mut self, remote: SocketAddrV4, buf: DemiBuffer) -> Result<(), Fail> {
+        // Push data to the receiver-side shared queue. This will cause the
+        // associated pool operation to be ready.
+        self.recv_queue.push((remote, buf));
+        Ok(())
     }
 
-    /// Asynchronously pops a message from the target shared queue.
-    pub async fn pop(&mut self) -> Result<T, Fail> {
-        match self.rx.borrow_mut().next().await {
-            Some(msg) => {
-                *self.length.borrow_mut() -= 1;
-                Ok(msg)
-            },
-            None => Err(Fail::new(EIO, "failed to pop from shared queue")),
-        }
-    }
-}
-
-/// Getters and setters for per UDP queue metadata.
-impl UdpQueue {
-    pub fn new() -> Self {
-        Self {
-            addr: None,
-            recv_queue: None,
-        }
-    }
-
-    /// Check whether the queue/socket is bound to an address.
     pub fn is_bound(&self) -> bool {
-        self.addr != None
-    }
-
-    /// Get the address assigned to this socket.
-    pub fn get_addr(&self) -> Result<SocketAddrV4, Fail> {
-        match self.addr {
-            Some(addr) => Ok(addr.clone()),
-            None => Err(Fail::new(libc::ENOTCONN, "port not bound")),
-        }
-    }
-
-    /// Get the recv queue associated with this socket.
-    pub fn get_recv_queue(&self) -> SharedQueue<SharedQueueSlot<DemiBuffer>> {
-        match &self.recv_queue {
-            Some(recv) => recv.clone(),
-            None => panic!("No allocated receive queue!"),
-        }
-    }
-
-    /// Set the address assigned to this socket/Demikernel queue.
-    pub fn set_addr(&mut self, addr: SocketAddrV4) {
-        self.addr = Some(addr);
-    }
-
-    /// Set the recv_queue for this socket/Demikernel queue.
-    pub fn set_recv_queue(&mut self, queue: SharedQueue<SharedQueueSlot<DemiBuffer>>) {
-        self.recv_queue = Some(queue);
+        self.bound.is_some()
     }
 }
 
@@ -164,22 +172,48 @@ impl UdpQueue {
 // Trait Implementations
 //======================================================================================================================
 
-/// Clone Trait Implementation for Shared Queues.
-impl<T> Clone for SharedQueue<T> {
-    /// Clones the target [SharedQueue].
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-            rx: self.rx.clone(),
-            length: self.length.clone(),
-            capacity: self.capacity,
-        }
+/// IoQueue Trait Implementation for UDP Queues.
+impl<const N: usize> IoQueue for SharedUdpQueue<N> {
+    fn get_qtype(&self) -> crate::QType {
+        crate::QType::UdpSocket
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn as_any(self: Box<Self>) -> Box<dyn Any> {
+        self
     }
 }
 
-/// IoQueue Trait Implementation for UDP Queues.
-impl IoQueue for UdpQueue {
-    fn get_qtype(&self) -> crate::QType {
-        crate::QType::UdpSocket
+impl<const N: usize> Deref for SharedUdpQueue<N> {
+    type Target = UdpQueue<N>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<const N: usize> DerefMut for SharedUdpQueue<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
+    }
+}
+
+impl<const N: usize> NetworkQueue for SharedUdpQueue<N> {
+    /// Returns the local address to which the target queue is bound.
+    fn local(&self) -> Option<SocketAddrV4> {
+        self.bound
+    }
+
+    /// Returns the remote address to which the target queue is connected to.
+    /// TODO: Add later if we support connected UDP sockets.
+    fn remote(&self) -> Option<SocketAddrV4> {
+        None
     }
 }

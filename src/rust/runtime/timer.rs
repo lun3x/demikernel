@@ -5,22 +5,26 @@
 // Imports
 //==============================================================================
 
-use crate::collections::intrusive::pairing_heap::{
-    HeapNode,
-    PairingHeap,
+use crate::runtime::{
+    scheduler::{
+        Yielder,
+        YielderHandle,
+    },
+    Fail,
+    SharedObject,
 };
-use ::futures::future::FusedFuture;
+use ::async_trait::async_trait;
+use ::core::cmp::Reverse;
+use ::futures::{
+    future::FusedFuture,
+    FutureExt,
+};
 use ::std::{
-    cell::RefCell,
+    collections::BinaryHeap,
     future::Future,
-    marker::PhantomData,
-    ops::Deref,
-    pin::Pin,
-    rc::Rc,
-    task::{
-        Context,
-        Poll,
-        Waker,
+    ops::{
+        Deref,
+        DerefMut,
     },
     time::{
         Duration,
@@ -29,124 +33,122 @@ use ::std::{
 };
 
 //==============================================================================
-// Traits
-//==============================================================================
-
-pub trait TimerPtr: Sized {
-    fn timer(&self) -> &Timer<Self>;
-}
-
-//==============================================================================
-// Enumerations
-//==============================================================================
-
-enum PollState {
-    Unregistered,
-    Registered,
-    Expired,
-}
-
-//==============================================================================
 // Structures
 //==============================================================================
 
 struct TimerQueueEntry {
     expiry: Instant,
-    task: Option<Waker>,
-    state: PollState,
+    yielder: YielderHandle,
 }
 
-struct TimerInner {
+/// Timer that holds one or more events for future wake up.
+pub struct Timer {
     now: Instant,
-    heap: PairingHeap<TimerQueueEntry>,
-}
-
-pub struct Timer<P: TimerPtr> {
-    inner: RefCell<TimerInner>,
-    _marker: PhantomData<P>,
+    // Use a reverse to get a min heap.
+    heap: BinaryHeap<Reverse<TimerQueueEntry>>,
 }
 
 #[derive(Clone)]
-pub struct TimerRc(pub Rc<Timer<TimerRc>>);
-
-pub struct WaitFuture<P: TimerPtr> {
-    ptr: Option<P>,
-    wait_node: HeapNode<TimerQueueEntry>,
-}
+pub struct SharedTimer(SharedObject<Timer>);
 
 //==============================================================================
 // Associate Functions
 //==============================================================================
 
-impl<P: TimerPtr> Timer<P> {
+impl SharedTimer {
     pub fn new(now: Instant) -> Self {
-        let inner = TimerInner {
+        Self(SharedObject::<Timer>::new(Timer {
             now,
-            heap: PairingHeap::new(),
-        };
-        Self {
-            inner: RefCell::new(inner),
-            _marker: PhantomData,
-        }
+            heap: BinaryHeap::new(),
+        }))
     }
 
-    pub fn advance_clock(&self, now: Instant) {
-        let mut inner = self.inner.borrow_mut();
-        assert!(inner.now <= now);
+    pub fn advance_clock(&mut self, now: Instant) {
+        assert!(self.now <= now);
 
-        while let Some(mut first) = inner.heap.peek_min() {
-            unsafe {
-                let entry = first.as_mut();
-                let first_expiry = entry.expiry;
-                if now < first_expiry {
-                    break;
-                }
-                entry.state = PollState::Expired;
-                if let Some(task) = entry.task.take() {
-                    task.wake();
-                }
-                inner.heap.remove(entry);
+        while let Some(Reverse(entry)) = self.heap.peek() {
+            if now < entry.expiry {
+                break;
             }
+            let mut entry: TimerQueueEntry = self
+                .heap
+                .pop()
+                .expect("should have an entry because we were able to peek")
+                .0;
+            entry.yielder.wake_with(Ok(()));
         }
-        inner.now = now;
+        self.now = now;
     }
 
     pub fn now(&self) -> Instant {
-        self.inner.borrow().now
+        self.now
     }
 
-    pub fn wait(&self, ptr: P, timeout: Duration) -> WaitFuture<P> {
-        self.wait_until(ptr, self.now() + timeout)
+    pub async fn wait(self, timeout: Duration, yielder: &Yielder) -> Result<(), Fail> {
+        let now: Instant = self.now;
+        self.wait_until(now + timeout, &yielder).await
     }
 
-    pub fn wait_until(&self, ptr: P, expiry: Instant) -> WaitFuture<P> {
+    pub async fn wait_until(mut self, expiry: Instant, yielder: &Yielder) -> Result<(), Fail> {
         let entry = TimerQueueEntry {
             expiry,
-            task: None,
-            state: PollState::Unregistered,
+            yielder: yielder.get_handle(),
         };
-        WaitFuture {
-            ptr: Some(ptr),
-            wait_node: HeapNode::new(entry),
+        self.heap.push(Reverse(entry));
+        yielder.yield_until_wake().await
+    }
+}
+
+//======================================================================================================================
+// Traits
+//======================================================================================================================
+
+/// Provides useful high-level future-related methods.
+#[async_trait(?Send)]
+pub trait UtilityMethods: Future + FusedFuture + Unpin {
+    /// Transforms our current future to include a timeout. We either return the results of the
+    /// future finishing or a Timeout error. Whichever happens first.
+    async fn with_timeout<Timer>(&mut self, timer: Timer) -> Result<Self::Output, Fail>
+    where
+        Timer: Future<Output = Result<(), Fail>>,
+    {
+        futures::select! {
+            result = self => Ok(result),
+            result = timer.fuse() => match result {
+                Ok(()) => Err(Fail::new(libc::ETIMEDOUT, "timer expired")),
+                Err(e) => Err(e),
+            },
         }
     }
 }
+
+// Implement UtiliytMethods for any Future that implements Unpin and FusedFuture.
+impl<F: ?Sized> UtilityMethods for F where F: Future + Unpin + FusedFuture {}
 
 //==============================================================================
 // Trait Implementations
 //==============================================================================
 
-impl Deref for TimerRc {
-    type Target = Rc<Timer<TimerRc>>;
+impl Default for SharedTimer {
+    fn default() -> Self {
+        Self(SharedObject::<Timer>::new(Timer {
+            now: Instant::now(),
+            heap: BinaryHeap::new(),
+        }))
+    }
+}
+
+impl Deref for SharedTimer {
+    type Target = Timer;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl TimerPtr for TimerRc {
-    fn timer(&self) -> &Timer<Self> {
-        &*self.0
+impl DerefMut for SharedTimer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
     }
 }
 
@@ -173,85 +175,19 @@ impl Ord for TimerQueueEntry {
     }
 }
 
-impl<P: TimerPtr> Future for WaitFuture<P> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut_self: &mut Self = unsafe { Pin::get_unchecked_mut(self) };
-
-        let result = {
-            let ptr = mut_self.ptr.as_ref().expect("Polled future after completion");
-            let timer = ptr.timer();
-
-            let mut inner = timer.inner.borrow_mut();
-            let wait_node = &mut mut_self.wait_node;
-
-            match wait_node.state {
-                PollState::Unregistered => {
-                    if inner.now >= wait_node.expiry {
-                        wait_node.state = PollState::Expired;
-                        Poll::Ready(())
-                    } else {
-                        wait_node.task = Some(cx.waker().clone());
-                        wait_node.state = PollState::Registered;
-                        unsafe {
-                            inner.heap.insert(wait_node);
-                        }
-                        Poll::Pending
-                    }
-                },
-                PollState::Registered => {
-                    if wait_node.task.as_ref().map_or(true, |w| !w.will_wake(cx.waker())) {
-                        wait_node.task = Some(cx.waker().clone());
-                    }
-                    Poll::Pending
-                },
-                PollState::Expired => Poll::Ready(()),
-            }
-        };
-        if result.is_ready() {
-            mut_self.ptr = None;
-        }
-        result
-    }
-}
-
-impl<P: TimerPtr> FusedFuture for WaitFuture<P> {
-    fn is_terminated(&self) -> bool {
-        self.ptr.is_none()
-    }
-}
-
-impl<P: TimerPtr> Drop for WaitFuture<P> {
-    fn drop(&mut self) {
-        // If this TimerFuture has been polled and it was added to the
-        // wait queue at the timer, it must be removed before dropping.
-        // Otherwise the timer would access invalid memory.
-        if let Some(ptr) = &self.ptr {
-            if let PollState::Registered = self.wait_node.state {
-                unsafe { ptr.timer().inner.borrow_mut().heap.remove(&mut self.wait_node) };
-                self.wait_node.state = PollState::Unregistered;
-            }
-        }
-    }
-}
-
 //==============================================================================
 // Unit Tests
 //==============================================================================
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Timer,
-        TimerRc,
-    };
+    use super::SharedTimer;
+    use crate::runtime::scheduler::Yielder;
     use ::anyhow::Result;
     use futures::task::noop_waker_ref;
     use std::{
         future::Future,
         pin::Pin,
-        rc::Rc,
         task::Context,
         time::{
             Duration,
@@ -264,9 +200,11 @@ mod tests {
         let mut ctx = Context::from_waker(noop_waker_ref());
         let mut now = Instant::now();
 
-        let timer = TimerRc(Rc::new(Timer::new(now)));
+        let mut timer: SharedTimer = SharedTimer::new(now);
+        let timer_ref: SharedTimer = timer.clone();
+        let yielder: Yielder = Yielder::new();
 
-        let wait_future1 = timer.wait(timer.clone(), Duration::from_secs(2));
+        let wait_future1 = timer_ref.wait(Duration::from_secs(2), &yielder);
         futures::pin_mut!(wait_future1);
 
         crate::ensure_eq!(Future::poll(Pin::new(&mut wait_future1), &mut ctx).is_pending(), true);
@@ -274,8 +212,10 @@ mod tests {
         now += Duration::from_millis(500);
         timer.advance_clock(now);
 
+        let timer_ref2: SharedTimer = timer.clone();
+        let yielder2: Yielder = Yielder::new();
         crate::ensure_eq!(Future::poll(Pin::new(&mut wait_future1), &mut ctx).is_pending(), true);
-        let wait_future2 = timer.wait(timer.clone(), Duration::from_secs(1));
+        let wait_future2 = timer_ref2.wait(Duration::from_secs(1), &yielder2);
         futures::pin_mut!(wait_future2);
 
         crate::ensure_eq!(Future::poll(Pin::new(&mut wait_future1), &mut ctx).is_pending(), true);

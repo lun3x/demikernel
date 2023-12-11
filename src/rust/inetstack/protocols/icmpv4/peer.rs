@@ -2,23 +2,20 @@
 // Licensed under the MIT license.
 
 use crate::{
-    inetstack::{
-        futures::UtilityMethods,
-        protocols::{
-            arp::ArpPeer,
-            ethernet2::{
-                EtherType2,
-                Ethernet2Header,
-            },
-            icmpv4::datagram::{
-                self,
-                Icmpv4Header,
-                Icmpv4Message,
-                Icmpv4Type2,
-            },
-            ip::IpProtocol,
-            ipv4::Ipv4Header,
+    inetstack::protocols::{
+        arp::SharedArpPeer,
+        ethernet2::{
+            EtherType2,
+            Ethernet2Header,
         },
+        icmpv4::datagram::{
+            self,
+            Icmpv4Header,
+            Icmpv4Message,
+            Icmpv4Type2,
+        },
+        ip::IpProtocol,
+        ipv4::Ipv4Header,
     },
     runtime::{
         fail::Fail,
@@ -27,15 +24,14 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        queue::BackgroundTask,
+        scheduler::Yielder,
         timer::{
-            TimerRc,
-            WaitFuture,
+            SharedTimer,
+            UtilityMethods,
         },
-    },
-    scheduler::{
-        Scheduler,
-        TaskHandle,
+        SharedBox,
+        SharedDemiRuntime,
+        SharedObject,
     },
 };
 use ::futures::{
@@ -56,13 +52,14 @@ use ::rand::{
     SeedableRng,
 };
 use ::std::{
-    cell::RefCell,
     collections::HashMap,
-    future::Future,
     net::Ipv4Addr,
     num::Wrapping,
+    ops::{
+        Deref,
+        DerefMut,
+    },
     process,
-    rc::Rc,
     time::{
         Duration,
         Instant,
@@ -109,92 +106,80 @@ impl ReqQueue {
 /// ICMP for IPv4 is defined in RFC 792.
 ///
 pub struct Icmpv4Peer<const N: usize> {
-    /// Underlying Runtime
-    rt: Rc<dyn NetworkRuntime<N>>,
-
-    clock: TimerRc,
-
+    /// Shared DemiRuntime.
+    runtime: SharedDemiRuntime,
+    /// Underlying Network Transport
+    transport: SharedBox<dyn NetworkRuntime<N>>,
     local_link_addr: MacAddress,
     local_ipv4_addr: Ipv4Addr,
 
     /// Underlying ARP Peer
-    arp: ArpPeer<N>,
+    arp: SharedArpPeer<N>,
 
     /// Transmitter
     tx: mpsc::UnboundedSender<(Ipv4Addr, u16, u16, DemiBuffer)>,
 
     /// Queue of Requests
-    requests: Rc<RefCell<ReqQueue>>,
+    requests: ReqQueue,
 
     /// Sequence Number
     seq: Wrapping<u16>,
 
-    rng: Rc<RefCell<SmallRng>>,
-
-    /// The background co-routine relies to incoming PING requests.
-    /// We annotate it as unused because the compiler believes that it is never called which is not the case.
-    #[allow(unused)]
-    background: TaskHandle,
+    rng: SmallRng,
 }
 
-impl<const N: usize> Icmpv4Peer<N> {
-    /// Creates a new peer for handling ICMP.
+pub struct SharedIcmpv4Peer<const N: usize>(SharedObject<Icmpv4Peer<N>>);
+
+impl<const N: usize> SharedIcmpv4Peer<N> {
     pub fn new(
-        rt: Rc<dyn NetworkRuntime<N>>,
-        scheduler: Scheduler,
-        clock: TimerRc,
+        mut runtime: SharedDemiRuntime,
+        transport: SharedBox<dyn NetworkRuntime<N>>,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
-        arp: ArpPeer<N>,
+        arp: SharedArpPeer<N>,
         rng_seed: [u8; 32],
     ) -> Result<Self, Fail> {
-        let (tx, rx) = mpsc::unbounded();
-        let requests = ReqQueue::new();
-        let rng: Rc<RefCell<SmallRng>> = Rc::new(RefCell::new(SmallRng::from_seed(rng_seed)));
-        let task: BackgroundTask = BackgroundTask::new(
-            String::from("Inetstack::ICMP::background"),
+        let (tx, rx): (
+            mpsc::UnboundedSender<(Ipv4Addr, u16, u16, DemiBuffer)>,
+            mpsc::UnboundedReceiver<(Ipv4Addr, u16, u16, DemiBuffer)>,
+        ) = mpsc::unbounded();
+        runtime.insert_background_coroutine(
+            "Inetstack::ICMP::background",
             Box::pin(Self::background(
-                rt.clone(),
+                transport.clone(),
                 local_link_addr,
                 local_ipv4_addr,
                 arp.clone(),
                 rx,
             )),
-        );
-        let handle: TaskHandle = match scheduler.insert(task) {
-            Some(handle) => handle,
-            None => {
-                let message: String = format!("failed to schedule background co-routine for ICMPv4 module");
-                error!("{}", message);
-                return Err(Fail::new(libc::EAGAIN, &message));
-            },
-        };
-        Ok(Icmpv4Peer {
-            rt,
-            clock,
+        )?;
+        let requests = ReqQueue::new();
+        let rng: SmallRng = SmallRng::from_seed(rng_seed);
+        Ok(Self(SharedObject::new(Icmpv4Peer {
+            runtime: runtime.clone(),
+            transport: transport.clone(),
             local_link_addr,
             local_ipv4_addr,
-            arp,
+            arp: arp.clone(),
             tx,
-            requests: Rc::new(RefCell::new(requests)),
+            requests,
             seq: Wrapping(0),
             rng,
-            background: handle,
-        })
+        })))
     }
 
     /// Background task for replying to ICMP messages.
     async fn background(
-        rt: Rc<dyn NetworkRuntime<N>>,
+        mut transport: SharedBox<dyn NetworkRuntime<N>>,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
-        arp: ArpPeer<N>,
+        mut arp: SharedArpPeer<N>,
         mut rx: mpsc::UnboundedReceiver<(Ipv4Addr, u16, u16, DemiBuffer)>,
     ) {
         // Reply requests.
         while let Some((dst_ipv4_addr, id, seq_num, data)) = rx.next().await {
             debug!("initiating ARP query");
-            let dst_link_addr: MacAddress = match arp.query(dst_ipv4_addr).await {
+            let dst_link_addr: MacAddress = match arp.query(dst_ipv4_addr, &Yielder::new()).await {
                 Ok(dst_link_addr) => dst_link_addr,
                 Err(e) => {
                     warn!("reply_to_ping({}, {}, {}) failed: {:?}", dst_ipv4_addr, id, seq_num, e);
@@ -204,7 +189,7 @@ impl<const N: usize> Icmpv4Peer<N> {
             debug!("ARP query complete ({} -> {})", dst_ipv4_addr, dst_link_addr);
             debug!("reply ping ({}, {}, {})", dst_ipv4_addr, id, seq_num);
             // Send reply message.
-            rt.transmit(Box::new(Icmpv4Message::new(
+            transport.transmit(Box::new(Icmpv4Message::new(
                 Ethernet2Header::new(dst_link_addr, local_link_addr, EtherType2::Ipv4),
                 Ipv4Header::new(local_ipv4_addr, dst_ipv4_addr, IpProtocol::ICMPv4),
                 Icmpv4Header::new(Icmpv4Type2::EchoReply { id, seq_num }, 0),
@@ -224,7 +209,7 @@ impl<const N: usize> Icmpv4Peer<N> {
                     .unwrap();
             },
             Icmpv4Type2::EchoReply { id, seq_num } => {
-                if let Some(tx) = self.requests.borrow_mut().remove(&(id, seq_num)) {
+                if let Some(tx) = self.requests.remove(&(id, seq_num)) {
                     let _ = tx.send(());
                 }
             },
@@ -236,7 +221,7 @@ impl<const N: usize> Icmpv4Peer<N> {
     }
 
     /// Computes the identifier for an ICMP message.
-    fn make_id(&self) -> u16 {
+    fn make_id(&mut self) -> u16 {
         let mut state: u32 = 0xFFFF;
         let addr_octets: [u8; 4] = self.local_ipv4_addr.octets();
         state += u16::from_be_bytes([addr_octets[0], addr_octets[1]]) as u32;
@@ -247,7 +232,7 @@ impl<const N: usize> Icmpv4Peer<N> {
         state += u16::from_be_bytes([pid_buf[0], pid_buf[1]]) as u32;
         state += u16::from_be_bytes([pid_buf[2], pid_buf[3]]) as u32;
 
-        let nonce: [u8; 2] = self.rng.borrow_mut().gen();
+        let nonce: [u8; 2] = self.rng.gen();
         state += u16::from_be_bytes([nonce[0], nonce[1]]) as u32;
 
         while state > 0xFFFF {
@@ -264,53 +249,62 @@ impl<const N: usize> Icmpv4Peer<N> {
     }
 
     /// Sends a ping to a remote peer.Wrapping
-    pub fn ping(
-        &mut self,
-        dst_ipv4_addr: Ipv4Addr,
-        timeout: Option<Duration>,
-    ) -> impl Future<Output = Result<Duration, Fail>> {
+    pub async fn ping(&mut self, dst_ipv4_addr: Ipv4Addr, timeout: Option<Duration>) -> Result<Duration, Fail> {
         let timeout: Duration = timeout.unwrap_or_else(|| Duration::from_millis(5000));
         let id: u16 = self.make_id();
         let seq_num: u16 = self.make_seq_num();
         let echo_request: Icmpv4Type2 = Icmpv4Type2::EchoRequest { id, seq_num };
-        let arp: ArpPeer<N> = self.arp.clone();
-        let rt: Rc<dyn NetworkRuntime<N>> = self.rt.clone();
-        let clock: TimerRc = self.clock.clone();
-        let requests: Rc<RefCell<ReqQueue>> = self.requests.clone();
-        let local_link_addr: MacAddress = self.local_link_addr.clone();
-        let local_ipv4_addr: Ipv4Addr = self.local_ipv4_addr.clone();
-        async move {
-            let t0: Instant = clock.now();
-            debug!("initiating ARP query");
-            let dst_link_addr: MacAddress = arp.query(dst_ipv4_addr).await?;
-            debug!("ARP query complete ({} -> {})", dst_ipv4_addr, dst_link_addr);
 
-            let data: DemiBuffer = DemiBuffer::new(datagram::ICMPV4_ECHO_REQUEST_MESSAGE_SIZE);
+        let t0: Instant = self.runtime.get_now();
+        debug!("initiating ARP query");
+        let dst_link_addr: MacAddress = self.arp.query(dst_ipv4_addr, &Yielder::new()).await?;
+        debug!("ARP query complete ({} -> {})", dst_ipv4_addr, dst_link_addr);
 
-            let msg: Icmpv4Message = Icmpv4Message::new(
-                Ethernet2Header::new(dst_link_addr, local_link_addr, EtherType2::Ipv4),
-                Ipv4Header::new(local_ipv4_addr, dst_ipv4_addr, IpProtocol::ICMPv4),
-                Icmpv4Header::new(echo_request, 0),
-                data,
-            );
-            rt.transmit(Box::new(msg));
-            let rx: Receiver<()> = {
-                let (tx, rx) = channel();
-                assert!(requests.borrow_mut().insert((id, seq_num), tx).is_none());
-                rx
-            };
-            let timer: WaitFuture<TimerRc> = clock.wait(clock.clone(), timeout);
-            match rx.fuse().with_timeout(timer).await? {
-                // Request completed successfully.
-                Ok(_) => Ok(clock.now() - t0),
-                // Request expired.
-                Err(_) => {
-                    let message: String = format!("timer expired");
-                    requests.borrow_mut().remove(&(id, seq_num));
-                    error!("ping(): {}", message);
-                    Err(Fail::new(libc::ETIMEDOUT, &message))
-                },
-            }
+        let data: DemiBuffer = DemiBuffer::new(datagram::ICMPV4_ECHO_REQUEST_MESSAGE_SIZE);
+
+        let msg: Icmpv4Message = Icmpv4Message::new(
+            Ethernet2Header::new(dst_link_addr, self.local_link_addr, EtherType2::Ipv4),
+            Ipv4Header::new(self.local_ipv4_addr, dst_ipv4_addr, IpProtocol::ICMPv4),
+            Icmpv4Header::new(echo_request, 0),
+            data,
+        );
+        self.transport.transmit(Box::new(msg));
+        let rx: Receiver<()> = {
+            let (tx, rx) = channel();
+            assert!(self.requests.insert((id, seq_num), tx).is_none());
+            rx
+        };
+        let yielder: Yielder = Yielder::new();
+        let clock_ref: SharedTimer = self.runtime.get_timer();
+        let timer = clock_ref.wait(timeout, &yielder);
+        match rx.fuse().with_timeout(timer).await? {
+            // Request completed successfully.
+            Ok(_) => Ok(self.runtime.get_now() - t0),
+            // Request expired.
+            Err(_) => {
+                let message: String = format!("timer expired");
+                self.requests.remove(&(id, seq_num));
+                error!("ping(): {}", message);
+                Err(Fail::new(libc::ETIMEDOUT, &message))
+            },
         }
+    }
+}
+
+//======================================================================================================================
+// Trait Implementations
+//======================================================================================================================
+
+impl<const N: usize> Deref for SharedIcmpv4Peer<N> {
+    type Target = Icmpv4Peer<N>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<const N: usize> DerefMut for SharedIcmpv4Peer<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
     }
 }

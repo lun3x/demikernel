@@ -18,7 +18,7 @@ use demikernel::{
 };
 use std::{
     collections::HashMap,
-    net::SocketAddrV4,
+    net::SocketAddr,
     slice,
     time::{
         Duration,
@@ -30,7 +30,7 @@ use std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -57,7 +57,7 @@ pub struct TcpEchoClient {
     /// Set of connected clients.
     clients: HashMap<QDesc, (Vec<u8>, usize)>,
     /// Address of remote peer.
-    remote: SocketAddrV4,
+    remote: SocketAddr,
     /// List of pending operations.
     qts: Vec<QToken>,
     /// Reverse lookup table of pending operations.
@@ -70,7 +70,7 @@ pub struct TcpEchoClient {
 
 impl TcpEchoClient {
     /// Instantiates a new TCP echo client.
-    pub fn new(libos: LibOS, bufsize: usize, remote: SocketAddrV4) -> Result<Self> {
+    pub fn new(libos: LibOS, bufsize: usize, remote: SocketAddr) -> Result<Self> {
         return Ok(Self {
             libos,
             bufsize,
@@ -349,7 +349,7 @@ impl TcpEchoClient {
         let errno: i64 = qr.qr_ret;
 
         // Check if client has reset the connection.
-        if errno == libc::ECONNRESET as i64 {
+        if is_closed(errno) {
             println!("INFO: server reset connection (qd={:?})", qd);
             self.handle_close(qd)?;
         } else {
@@ -380,8 +380,8 @@ impl TcpEchoClient {
 
     /// Handles a close operation.
     fn handle_close(&mut self, qd: QDesc) -> Result<()> {
-        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.drain_filter(|_k, v| v == &qd).collect();
-        let _: Vec<_> = self.qts.drain_filter(|x| qts_drained.contains_key(x)).collect();
+        let qts_drained: HashMap<QToken, QDesc> = self.qts_reverse.extract_if(|_k, v| v == &qd).collect();
+        let _: Vec<_> = self.qts.extract_if(|x| qts_drained.contains_key(x)).collect();
         self.clients.remove(&qd);
         self.libos.close(qd)?;
         println!("INFO: {} clients connected", self.clients.len());
@@ -401,6 +401,17 @@ impl TcpEchoClient {
             .remove(&qt)
             .ok_or(anyhow::anyhow!("unregistered queue token qt={:?}", qt))?;
         Ok(())
+    }
+}
+
+//======================================================================================================================
+// Standalone functions
+//======================================================================================================================
+
+fn is_closed(ret: i64) -> bool {
+    match ret as i32 {
+        libc::ECONNRESET | libc::ENOTCONN | libc::ECANCELED | libc::EBADF => true,
+        _ => false,
     }
 }
 

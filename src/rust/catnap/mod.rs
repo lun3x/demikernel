@@ -1,44 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-mod coroutines;
 mod queue;
-mod runtime;
-mod socket;
-
-//==============================================================================
-// Exports
-//==============================================================================
-
-pub use self::{
-    queue::CatnapQueue,
-    runtime::PosixRuntime,
-};
+#[cfg_attr(target_os = "linux", path = "linux/transport.rs")]
+#[cfg_attr(target_os = "windows", path = "win/transport.rs")]
+mod transport;
 
 //==============================================================================
 // Imports
 //==============================================================================
 
-use self::{
-    coroutines::{
-        accept::accept_coroutine,
-        close::close_coroutine,
-        connect::connect_coroutine,
-        pop::pop_coroutine,
-        push::push_coroutine,
-    },
-    socket::Socket,
-};
 use crate::{
-    demikernel::config::Config,
-    pal::{
-        data_structures::{
-            SockAddr,
-            SockAddrIn,
-            Socklen,
-        },
-        linux,
+    catnap::{
+        queue::SharedCatnapQueue,
+        transport::SharedCatnapTransport,
     },
+    demikernel::config::Config,
+    pal::constants::SOMAXCONN,
     runtime::{
         fail::Fail,
         limits,
@@ -46,142 +24,121 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
+        network::{
+            socket::SocketId,
+            unwrap_socketaddr,
+        },
         queue::{
-            IoQueueTable,
+            downcast_queue,
             Operation,
             OperationResult,
-            OperationTask,
+        },
+        scheduler::{
+            TaskHandle,
+            Yielder,
+            YielderHandle,
         },
         types::{
-            demi_accept_result_t,
-            demi_opcode_t,
-            demi_qr_value_t,
             demi_qresult_t,
             demi_sgarray_t,
         },
         QDesc,
         QToken,
-        QType,
-    },
-    scheduler::{
-        TaskHandle,
-        Yielder,
-        YielderHandle,
+        SharedDemiRuntime,
+        SharedObject,
     },
 };
+use ::socket2::{
+    Domain,
+    Protocol,
+    Type,
+};
 use ::std::{
-    cell::{
-        RefCell,
-        RefMut,
-    },
-    mem,
     net::{
         Ipv4Addr,
+        SocketAddr,
         SocketAddrV4,
     },
-    os::unix::prelude::RawFd,
+    ops::{
+        Deref,
+        DerefMut,
+    },
     pin::Pin,
-    rc::Rc,
 };
 
 #[cfg(feature = "profiler")]
 use crate::timer;
 
 //======================================================================================================================
-// Types
-//======================================================================================================================
-
-//======================================================================================================================
 // Structures
 //======================================================================================================================
 
-/// Catnap LibOS
+/// [CatnapLibOS] represents a multi-queue Catnap library operating system that provides the Demikernel API on top of
+/// the Linux/POSIX API. [CatnapLibOS] is stateless and purely contains multi-queue functionality necessary to run the
+/// Catnap libOS. All state is kept in the [runtime] and [qtable].
+/// TODO: Move [qtable] into [runtime] so all state is contained in the PosixRuntime.
 pub struct CatnapLibOS {
-    /// Table of queue descriptors.
-    qtable: Rc<RefCell<IoQueueTable<CatnapQueue>>>,
     /// Underlying runtime.
-    runtime: PosixRuntime,
+    runtime: SharedDemiRuntime,
+    /// Underlying network transport.
+    transport: SharedCatnapTransport,
 }
+
+#[derive(Clone)]
+pub struct SharedCatnapLibOS(SharedObject<CatnapLibOS>);
 
 //======================================================================================================================
 // Associate Functions
 //======================================================================================================================
 
-/// Associate Functions for Catnap LibOS
 impl CatnapLibOS {
+    pub fn new(config: &Config, runtime: SharedDemiRuntime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            transport: SharedCatnapTransport::new(config, runtime),
+        }
+    }
+}
+
+/// Associate Functions for Catnap LibOS
+impl SharedCatnapLibOS {
     /// Instantiates a Catnap LibOS.
-    pub fn new(_config: &Config) -> Self {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::new");
-        let qtable: Rc<RefCell<IoQueueTable<CatnapQueue>>> = Rc::new(RefCell::new(IoQueueTable::<CatnapQueue>::new()));
-        let runtime: PosixRuntime = PosixRuntime::new();
-        Self { qtable, runtime }
+    pub fn new(_config: &Config, runtime: SharedDemiRuntime) -> Self {
+        Self(SharedObject::new(CatnapLibOS::new(_config, runtime)))
     }
 
-    /// Creates a socket.
-    pub fn socket(&mut self, domain: libc::c_int, typ: libc::c_int, _protocol: libc::c_int) -> Result<QDesc, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::socket");
+    /// Creates a socket. This function contains the libOS-level functionality needed to create a SharedCatnapQueue that
+    /// wraps the underlying POSIX socket.
+    pub fn socket(&mut self, domain: Domain, typ: Type, _protocol: Protocol) -> Result<QDesc, Fail> {
         trace!("socket() domain={:?}, type={:?}, protocol={:?}", domain, typ, _protocol);
 
         // Parse communication domain.
-        if domain != libc::AF_INET {
+        if domain != Domain::IPV4 {
             return Err(Fail::new(libc::ENOTSUP, "communication domain not supported"));
         }
 
-        // Parse socket type and protocol.
-        if (typ != libc::SOCK_STREAM) && (typ != libc::SOCK_DGRAM) {
-            return Err(Fail::new(libc::ENOTSUP, "socket type not supported"));
+        // Parse socket type.
+        if (typ != Type::STREAM) && (typ != Type::DGRAM) {
+            let cause: String = format!("socket type not supported (type={:?})", typ);
+            error!("socket(): {}", cause);
+            return Err(Fail::new(libc::ENOTSUP, &cause));
         }
 
-        // Create socket.
-        match unsafe { libc::socket(domain, typ, 0) } {
-            fd if fd >= 0 => {
-                let qtype: QType = match typ {
-                    libc::SOCK_STREAM => QType::TcpSocket,
-                    libc::SOCK_DGRAM => QType::UdpSocket,
-                    _ => return Err(Fail::new(libc::ENOTSUP, "socket type not supported")),
-                };
-
-                // Set socket options.
-                unsafe {
-                    if typ == libc::SOCK_STREAM {
-                        if linux::set_tcp_nodelay(fd) != 0 {
-                            let errno: libc::c_int = *libc::__errno_location();
-                            warn!("cannot set TCP_NONDELAY option (errno={:?})", errno);
-                        }
-                    }
-                    if linux::set_nonblock(fd) != 0 {
-                        let errno: libc::c_int = *libc::__errno_location();
-                        warn!("cannot set O_NONBLOCK option (errno={:?})", errno);
-                    }
-                    if linux::set_so_reuseport(fd) != 0 {
-                        let errno: libc::c_int = *libc::__errno_location();
-                        warn!("cannot set SO_REUSEPORT option (errno={:?})", errno);
-                    }
-                }
-
-                trace!("socket: {:?}, domain: {:?}, typ: {:?}", fd, domain, typ);
-                let qd: QDesc = self.qtable.borrow_mut().alloc(CatnapQueue::new(qtype, Some(fd)));
-                Ok(qd)
-            },
-            _ => {
-                let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                Err(Fail::new(errno, "failed to create socket"))
-            },
-        }
+        // Create underlying queue.
+        let queue: SharedCatnapQueue = SharedCatnapQueue::new(domain, typ, self.transport.clone())?;
+        let qd: QDesc = self.runtime.alloc_queue(queue);
+        Ok(qd)
     }
 
-    /// Binds a socket to a local endpoint.
-    pub fn bind(&mut self, qd: QDesc, local: SocketAddrV4) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::bind");
+    /// Binds a socket to a local endpoint. This function contains the libOS-level functionality needed to bind a
+    /// SharedCatnapQueue to a local address.
+    pub fn bind(&mut self, qd: QDesc, local: SocketAddr) -> Result<(), Fail> {
         trace!("bind() qd={:?}, local={:?}", qd, local);
-        let mut qtable: RefMut<IoQueueTable<CatnapQueue>> = self.qtable.borrow_mut();
 
+        let localv4: SocketAddrV4 = unwrap_socketaddr(local)?;
         // Check if we are binding to the wildcard address.
         // FIXME: https://github.com/demikernel/demikernel/issues/189
-        if local.ip() == &Ipv4Addr::UNSPECIFIED {
+        if localv4.ip() == &Ipv4Addr::UNSPECIFIED {
             let cause: String = format!("cannot bind to wildcard address (qd={:?})", qd);
             error!("bind(): {}", cause);
             return Err(Fail::new(libc::ENOTSUP, &cause));
@@ -195,591 +152,376 @@ impl CatnapLibOS {
             return Err(Fail::new(libc::ENOTSUP, &cause));
         }
 
-        // Check if queue descriptor is valid.
-        if qtable.get(&qd).is_none() {
-            let cause: String = format!("invalid queue descriptor {:?}", qd);
-            error!("bind(): {}", &cause);
-            return Err(Fail::new(libc::EBADF, &cause));
-        }
-
         // Check wether the address is in use.
-        for (_, queue) in qtable.get_values() {
-            if let Some(addr) = queue.get_socket().local() {
-                if addr == local {
-                    let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
-                    error!("bind(): {}", &cause);
-                    return Err(Fail::new(libc::EADDRINUSE, &cause));
-                }
-            }
+        if self.runtime.addr_in_use(localv4) {
+            let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
+            error!("bind(): {}", &cause);
+            return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
 
-        // Get a mutable reference to the queue table.
-        // The following call to expect() is safe because we checked before that the queue descriptor is valid.
-        let queue: &mut CatnapQueue = qtable
-            .get_mut(&qd)
-            .expect("queue descriptor should be in the queue table");
-
-        // Get reference to the underlying file descriptor.
-        // The following call to expect() is safe because when creating a queue we assigned it a valid file descritor.
-        let fd: RawFd = queue.get_fd().expect("queue should have a file descriptor");
-
-        // Create a socket that is bound to the target local address.
-        let bound_socket: Socket = {
-            let unbound_socket: &Socket = queue.get_socket();
-            unbound_socket.bind(local)?
-        };
-
-        // Bind underlying socket.
-        let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&local);
-        match unsafe { libc::bind(fd, &saddr as *const SockAddr, mem::size_of::<SockAddrIn>() as Socklen) } {
-            stats if stats == 0 => {
-                // Update socket.
-                queue.set_socket(&bound_socket);
-                Ok(())
-            },
-            _ => {
-                let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                error!("failed to bind socket (errno={:?})", errno);
-                Err(Fail::new(errno, "operation failed"))
-            },
-        }
+        // Issue bind operation.
+        self.get_shared_queue(&qd)?.bind(local)?;
+        // Insert into address to queue descriptor table.
+        self.runtime
+            .insert_socket_id_to_qd(SocketId::Passive(localv4.clone()), qd);
+        Ok(())
     }
 
-    /// Sets a socket as a passive one.
+    /// Sets a SharedCatnapQueue and its underlying socket as a passive one. This function contains the libOS-level
+    /// functionality to move the SharedCatnapQueue and underlying socket into the listen state.
     pub fn listen(&mut self, qd: QDesc, backlog: usize) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::listen");
         trace!("listen() qd={:?}, backlog={:?}", qd, backlog);
 
         // We just assert backlog here, because it was previously checked at PDPIX layer.
-        debug_assert!((backlog > 0) && (backlog <= libc::SOMAXCONN as usize));
+        debug_assert!((backlog > 0) && (backlog <= SOMAXCONN as usize));
 
         // Issue listen operation.
-        match self.qtable.borrow_mut().get_mut(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    // Create a listening socket.
-                    let listening_socket: Socket = {
-                        let bound_socket: &Socket = queue.get_socket();
-                        bound_socket.listen()?
-                    };
-
-                    if unsafe { libc::listen(fd, backlog as i32) } != 0 {
-                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                        error!("failed to listen ({:?})", errno);
-                        return Err(Fail::new(errno, "operation failed"));
-                    }
-
-                    // Update socket.
-                    queue.set_socket(&listening_socket);
-                    Ok(())
-                },
-                None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
-            },
-            None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
-        }
+        self.get_shared_queue(&qd)?.listen(backlog)
     }
 
-    /// Accepts connections on a socket.
+    /// Synchronous cross-queue code to start accepting a connection. This function schedules the asynchronous
+    /// coroutine and performs any necessary synchronous, multi-queue operations at the libOS-level before beginning
+    /// the accept.
     pub fn accept(&mut self, qd: QDesc) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::accept");
         trace!("accept(): qd={:?}", qd);
-        let mut qtable: RefMut<IoQueueTable<CatnapQueue>> = self.qtable.borrow_mut();
-        let fd: RawFd = match qtable.get_mut(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    // Create an accepting socket.
-                    {
-                        let listening_socket: &Socket = queue.get_socket();
-                        let accepting_socket: Socket = listening_socket.accept()?;
-                        queue.set_socket(&accepting_socket);
-                    };
-                    fd
-                },
-                None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
-            },
-            None => return Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::accept for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().accept_coroutine(qd, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
 
-        let new_qd: QDesc = qtable.alloc(CatnapQueue::new(QType::TcpSocket, None));
-        let qtable_ptr: Rc<RefCell<IoQueueTable<CatnapQueue>>> = self.qtable.clone();
-        let yielder: Yielder = Yielder::new();
-        let yielder_handle: YielderHandle = yielder.get_handle();
-        let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-            // Wait for the accept operation to complete.
-            let result: Result<(RawFd, SocketAddrV4), Fail> = accept_coroutine(fd, yielder).await;
-            // Handle result: Borrow the queue table to either set the socket fd and addr or free the queue
-            // metadata on error.
-            match result {
-                Ok((new_fd, addr)) => {
-                    let mut qtable_: RefMut<IoQueueTable<CatnapQueue>> = qtable_ptr.borrow_mut();
+        queue.accept(coroutine_constructor)
+    }
 
-                    // Update new (connected) socket.
-                    // Note that we do it first, because it is unlikely that the new socket has been closed.
-                    {
-                        let queue: &mut CatnapQueue = match qtable_.get_mut(&new_qd) {
-                            Some(queue) => queue,
-                            None => {
-                                let cause: String = format!("invalid queue descriptor {:?}", new_qd);
-                                error!("accept(): {}", &cause);
-                                return (qd, OperationResult::Failed(Fail::new(libc::EBADF, &cause)));
-                            },
-                        };
-
-                        let connected_socket: Socket = {
-                            let unbound_socket: &Socket = queue.get_socket();
-                            match unbound_socket.connected(addr) {
-                                Ok(socket) => socket,
-                                Err(e) => return (qd, OperationResult::Failed(e)),
-                            }
-                        };
-                        queue.set_socket(&connected_socket);
-                        queue.set_fd(new_fd);
-                    }
-
-                    // Update listening socket.
-                    {
-                        let queue: &mut CatnapQueue = match qtable_.get_mut(&qd) {
-                            Some(queue) => queue,
-                            None => {
-                                let cause: String = format!("invalid queue descriptor {:?}", qd);
-                                error!("accept(): {}", &cause);
-                                return (qd, OperationResult::Failed(Fail::new(libc::EBADF, &cause)));
-                            },
-                        };
-
-                        let listening_socket: Socket = {
-                            let accepting_socket: &Socket = queue.get_socket();
-                            match accepting_socket.accepted() {
-                                Ok(socket) => socket,
-                                Err(e) => return (qd, OperationResult::Failed(e)),
-                            }
-                        };
-                        queue.set_socket(&listening_socket);
-                    }
-                    (qd, OperationResult::Accept((new_qd, addr)))
-                },
-                Err(e) => {
-                    warn!("accept() listening_qd={:?} new_qd={:?}: {:?}", qd, new_qd, &e);
-                    // assert definitely no pending ops on new_qd
-                    qtable_ptr.borrow_mut().free(&new_qd);
-                    (qd, OperationResult::Failed(e))
-                },
-            }
-        });
-        let task_id: String = format!("Catnap::pop for qd={:?}", qd);
-        let task: OperationTask = OperationTask::new(task_id, coroutine);
-        match self.runtime.scheduler.insert(task) {
-            Some(handle) => {
-                // Borrow the scheduler handle and yielder handle to register a way to wake the coroutine.
-                // Safe to unwrap here because we have a linear flow from the last time that we looked up the queue.
-                qtable.get_mut(&qd).unwrap().add_pending_op(&handle, &yielder_handle);
-                Ok(handle.get_task_id().into())
+    /// Asynchronous cross-queue code for accepting a connection. This function returns a coroutine that runs
+    /// asynchronously to accept a connection and performs any necessary multi-queue operations at the libOS-level after
+    /// the accept succeeds or fails.
+    async fn accept_coroutine(mut self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue.clone(),
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for the accept operation to complete.
+        match queue.accept_coroutine(yielder).await {
+            Ok(new_queue) => {
+                // TODO: Do we need to add this to the socket id to queue descriptor table?
+                // It is safe to call except here because the new queue is connected and it should be connected to a
+                // remote address.
+                let addr: SocketAddr = new_queue
+                    .remote()
+                    .expect("An accepted socket must have a remote address");
+                let new_qd: QDesc = self.runtime.alloc_queue(new_queue);
+                // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+                (
+                    qd,
+                    OperationResult::Accept((new_qd, unwrap_socketaddr(addr).expect("we only support IPv4"))),
+                )
             },
-            None => {
-                qtable.free(&new_qd);
-                Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine"))
+            Err(e) => {
+                warn!("accept() listening_qd={:?}: {:?}", qd, &e);
+                (qd, OperationResult::Failed(e))
             },
         }
     }
 
-    /// Establishes a connection to a remote endpoint.
-    pub fn connect(&mut self, qd: QDesc, remote: SocketAddrV4) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::connect");
+    /// Synchronous code to establish a connection to a remote endpoint. This function schedules the asynchronous
+    /// coroutine and performs any necessary synchronous, multi-queue operations at the libOS-level before beginning
+    /// the connect.
+    pub fn connect(&mut self, qd: QDesc, remote: SocketAddr) -> Result<QToken, Fail> {
         trace!("connect() qd={:?}, remote={:?}", qd, remote);
-        // Issue connect operation.
-        match self.qtable.borrow_mut().get_mut(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    // Create a connecting socket.
-                    let active_socket: &Socket = queue.get_socket();
-                    let previous_socket_state: Socket = active_socket.clone();
-                    let connecting_socket: Socket = active_socket.connect(remote)?;
 
-                    // Spawn connect co-rountine.
-                    let qtable_ptr: Rc<RefCell<IoQueueTable<CatnapQueue>>> = self.qtable.clone();
-                    let yielder: Yielder = Yielder::new();
-                    let yielder_handle: YielderHandle = yielder.get_handle();
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        let result: Result<(), Fail> = connect_coroutine(fd, remote, yielder).await;
+        // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::connect for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().connect_coroutine(qd, remote, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
+        };
 
-                        // Parse result.
-                        match result {
-                            Ok(()) => {
-                                // Succeeded to connect, thus set socket as "connected".
-                                let mut qtable_: RefMut<IoQueueTable<CatnapQueue>> = qtable_ptr.borrow_mut();
-                                let queue: &mut CatnapQueue = qtable_.get_mut(&qd).expect("queue cannot be None");
-                                let connecting_socket: &Socket = queue.get_socket();
-                                let connected_socket: Socket = match connecting_socket.connected(remote) {
-                                    Ok(socket) => socket,
-                                    Err(e) => {
-                                        warn!(
-                                            "connect() failed to set socket as connected (qd={:?}, error={:?})",
-                                            qd, &e
-                                        );
-                                        return (qd, OperationResult::Failed(e));
-                                    },
-                                };
-                                queue.set_socket(&connected_socket);
-                                (qd, OperationResult::Connect)
-                            },
-                            Err(e) => {
-                                // Failed to connect, check if that happened due to other reason than cancellation.
-                                if e.errno != libc::ECANCELED {
-                                    let mut qtable_: RefMut<IoQueueTable<CatnapQueue>> = qtable_ptr.borrow_mut();
-                                    let queue: &mut CatnapQueue = qtable_.get_mut(&qd).expect("queue cannot be None");
-                                    let socket: &Socket = queue.get_socket();
+        queue.connect(coroutine_constructor)
+    }
 
-                                    // Failed to connect, rollback only if the operation was not cancelled.
-                                    if socket.is_connecting() {
-                                        debug!(
-                                            "connect() rolling back socket state (qd={:?}, state={:?})",
-                                            qd, previous_socket_state
-                                        );
-                                        queue.set_socket(&previous_socket_state);
-                                    }
-                                }
-
-                                warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);
-                                (qd, OperationResult::Failed(e))
-                            },
-                        }
-                    });
-                    let task_id: String = format!("Catnap::connect for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, coroutine);
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-
-                    // Borrow the scheduler handle and yielder handle to register a way to wake the coroutine.
-                    queue.add_pending_op(&handle, &yielder_handle);
-                    // Update socket.
-                    queue.set_socket(&connecting_socket);
-                    Ok(handle.get_task_id().into())
-                },
-                None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
+    /// Asynchronous code to establish a connection to a remote endpoint. This function returns a coroutine that runs
+    /// asynchronously to connect a queue and performs any necessary multi-queue operations at the libOS-level after
+    /// the connect succeeds or fails.
+    async fn connect_coroutine(self, qd: QDesc, remote: SocketAddr, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue.clone(),
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for connect operation to complete.
+        match queue.connect_coroutine(remote, yielder).await {
+            Ok(()) => {
+                // TODO: Do we need to add this to socket id to queue descriptor table?
+                (qd, OperationResult::Connect)
             },
-            None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+            Err(e) => {
+                warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);
+                (qd, OperationResult::Failed(e))
+            },
         }
     }
 
-    /// Closes a socket.
+    /// Synchronously closes a SharedCatnapQueue and its underlying POSIX socket.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::close");
         trace!("close() qd={:?}", qd);
-        let mut qtable: RefMut<IoQueueTable<CatnapQueue>> = self.qtable.borrow_mut();
-        match qtable.get_mut(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    // Set socket as closing.
-                    let socket: &Socket = queue.get_socket();
-                    let closing_socket: Socket = socket.close()?;
-                    queue.set_socket(&closing_socket);
 
-                    // Close underlying socket.
-                    if unsafe { libc::close(fd) } != 0 {
-                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                        let cause: String = format!("failed to close underlying socket (errno={:?})", errno);
-                        error!("close(): {:?}", &cause);
-                        return Err(Fail::new(errno, &cause));
-                    }
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        // Issue close operation.
+        queue.close()?;
 
-                    // Cancel all pending operations.
-                    queue.cancel_pending_ops(Fail::new(libc::ECANCELED, "This queue was closed"));
-
-                    // Update socket state.
-                    let socket: &Socket = queue.get_socket();
-                    let closed_socket: Socket = socket.closed()?;
-                    queue.set_socket(&closed_socket);
-
-                    qtable.free(&qd);
-                    Ok(())
-                },
-                None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
-            },
-            None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+        // If the queue was bound, remove from the socket id to queue descriptor table.
+        if let Some(local) = queue.local() {
+            self.runtime
+                .remove_socket_id_to_qd(&SocketId::Passive(unwrap_socketaddr(local)?));
         }
+
+        // Remove the queue from the queue table.
+        self.runtime.free_queue::<SharedCatnapQueue>(&qd)?;
+        Ok(())
     }
 
-    /// Asynchronous close
+    /// Synchronous code to asynchronously close a queue. This function schedules the coroutine that asynchronously
+    /// runs the close and any synchronous multi-queue functionality before the close begins.
     pub fn async_close(&mut self, qd: QDesc) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::async_close");
         trace!("async_close() qd={:?}", qd);
-        let mut qtable: RefMut<IoQueueTable<CatnapQueue>> = self.qtable.borrow_mut();
 
-        match qtable.get_mut(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    // Set socket as closing.
-                    let socket: &Socket = queue.get_socket();
-                    let closing_socket: Socket = socket.close()?;
-                    queue.set_socket(&closing_socket);
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::close for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().close_coroutine(qd, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
+        };
 
-                    let qtable_ptr: Rc<RefCell<IoQueueTable<CatnapQueue>>> = self.qtable.clone();
-                    // Don't register this Yielder because we shouldn't have to cancel the close operation.
-                    let yielder: Yielder = Yielder::new();
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        // Wait for close operation to complete.
-                        let result: Result<(), Fail> = close_coroutine(fd, yielder).await;
-                        // Handle result: if successful, borrow the queue table to free the qd and metadata.
-                        match result {
-                            Ok(()) => {
-                                // Update socket.
-                                let mut qtable_: RefMut<IoQueueTable<CatnapQueue>> = qtable_ptr.borrow_mut();
-                                match qtable_.get_mut(&qd) {
-                                    Some(queue) => {
-                                        // Cancel all pending operations.
-                                        queue.cancel_pending_ops(Fail::new(libc::ECANCELED, "This queue was closed"));
-                                        // Update socket state.
-                                        let socket: &Socket = queue.get_socket();
-                                        let closed_socket: Socket = match socket.closed() {
-                                            Ok(socket) => socket,
-                                            Err(e) => {
-                                                // This is unlikely to happen. If it does, it means that we have
-                                                // some uncovered race condition in the close co-routine.
-                                                warn!("close(): failed to set socket state ({:?})", e);
-                                                return (qd, OperationResult::Failed(e));
-                                            },
-                                        };
-                                        queue.set_socket(&closed_socket);
-                                    },
-                                    None => {
-                                        let cause: &String = &format!("invalid queue descriptor: {:?}", qd);
-                                        error!("{}", &cause);
-                                        return (qd, OperationResult::Failed(Fail::new(libc::EBADF, cause)));
-                                    },
-                                }
-                                qtable_.free(&qd);
-                                (qd, OperationResult::Close)
-                            },
-                            Err(e) => {
-                                warn!("async_close() qd={:?}: {:?}", qd, &e);
-                                (qd, OperationResult::Failed(e))
-                            },
-                        }
-                    });
-                    let task_id: String = format!("Catnap::close for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, coroutine);
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-                    Ok(handle.get_task_id().into())
-                },
-                None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
+        queue.async_close(coroutine_constructor)
+    }
+
+    /// Asynchronous code to close a queue. This function returns a coroutine that runs asynchronously to close a queue
+    /// and the underlying POSIX socket and performs any necessary multi-queue operations at the libOS-level after
+    /// the close succeeds or fails.
+    async fn close_coroutine(mut self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.runtime.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for close operation to complete.
+        match queue.close_coroutine(yielder).await {
+            Ok(()) => {
+                // If the queue was bound, remove from the socket id to queue descriptor table.
+                if let Some(local) = queue.local() {
+                    // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+                    self.runtime.remove_socket_id_to_qd(&SocketId::Passive(
+                        unwrap_socketaddr(local).expect("we only support IPv4"),
+                    ));
+                }
+                // Remove the queue from the queue table. Expect is safe here because we looked up the queue to
+                // schedule this coroutine and no other close coroutine should be able to run due to state machine
+                // checks.
+                self.runtime
+                    .free_queue::<SharedCatnapQueue>(&qd)
+                    .expect("queue should exist");
+                (qd, OperationResult::Close)
             },
-            None => return Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+            Err(e) => {
+                warn!("async_close() qd={:?}: {:?}", qd, &e);
+                (qd, OperationResult::Failed(e))
+            },
         }
     }
 
-    /// Pushes a scatter-gather array to a socket.
+    /// Synchronous code to push [buf] to a SharedCatnapQueue and its underlying POSIX socket. This function schedules the
+    /// coroutine that asynchronously runs the push and any synchronous multi-queue functionality before the push
+    /// begins.
     pub fn push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::push");
         trace!("push() qd={:?}", qd);
-        match self.runtime.clone_sgarray(sga) {
-            Ok(buf) => {
-                if buf.len() == 0 {
-                    return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
-                }
 
-                // Issue push operation.
-                match self.qtable.borrow_mut().get_mut(&qd) {
-                    Some(queue) => match queue.get_fd() {
-                        Some(fd) => {
-                            let yielder: Yielder = Yielder::new();
-                            let yielder_handle: YielderHandle = yielder.get_handle();
-                            let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                                // Wait for push to complete.
-                                let result: Result<(), Fail> = push_coroutine(fd, buf, None, yielder).await;
-                                // Handle result.
-                                match result {
-                                    Ok(()) => (qd, OperationResult::Push),
-                                    Err(e) => {
-                                        warn!("push() qd={:?}: {:?}", qd, &e);
-                                        (qd, OperationResult::Failed(e))
-                                    },
-                                }
-                            });
-                            let task_id: String = format!("Catnap::push for qd={:?}", qd);
-                            let task: OperationTask = OperationTask::new(task_id, coroutine);
-                            let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                                Some(handle) => handle,
-                                None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                            };
-                            // Borrow the scheduler handle and yielder handle to register a way to wake the coroutine.
-                            queue.add_pending_op(&handle, &yielder_handle);
+        let buf: DemiBuffer = self.runtime.clone_sgarray(sga)?;
+        if buf.len() == 0 {
+            return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
+        };
 
-                            Ok(handle.get_task_id().into())
-                        },
-                        None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
-                    },
-                    None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
-                }
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::push for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().push_coroutine(qd, buf, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
+        };
+
+        queue.push(coroutine_constructor)
+    }
+
+    /// Asynchronous code to push [buf] to a SharedCatnapQueue and its underlying POSIX socket. This function returns a
+    /// coroutine that runs asynchronously to push a queue and its underlying POSIX socket and performs any necessary
+    /// multi-queue operations at the libOS-level after the push succeeds or fails.
+    async fn push_coroutine(self, qd: QDesc, mut buf: DemiBuffer, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for push to complete.
+        match queue.push_coroutine(&mut buf, None, yielder).await {
+            Ok(()) => (qd, OperationResult::Push),
+            Err(e) => {
+                warn!("push() qd={:?}: {:?}", qd, &e);
+                (qd, OperationResult::Failed(e))
             },
-            Err(e) => Err(e),
         }
     }
 
-    /// Pushes a scatter-gather array to a socket.
-    pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, remote: SocketAddrV4) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::pushto");
+    /// Synchronous code to pushto [buf] to [remote] on a SharedCatnapQueue and its underlying POSIX socket. This
+    /// function schedules the coroutine that asynchronously runs the pushto and any synchronous multi-queue
+    /// functionality after pushto begins.
+    pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, remote: SocketAddr) -> Result<QToken, Fail> {
         trace!("pushto() qd={:?}", qd);
 
-        match self.runtime.clone_sgarray(sga) {
-            Ok(buf) => {
-                if buf.len() == 0 {
-                    return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
-                }
+        let buf: DemiBuffer = self.runtime.clone_sgarray(sga)?;
+        if buf.len() == 0 {
+            return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
+        }
 
-                // Issue pushto operation.
-                match self.qtable.borrow_mut().get_mut(&qd) {
-                    Some(queue) => match queue.get_fd() {
-                        Some(fd) => {
-                            let yielder: Yielder = Yielder::new();
-                            let yielder_handle: YielderHandle = yielder.get_handle();
-                            let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                                // Wait for pushto to complete.
-                                let result: Result<(), Fail> = push_coroutine(fd, buf, Some(remote), yielder).await;
-                                // Process result.
-                                match result {
-                                    Ok(()) => (qd, OperationResult::Push),
-                                    Err(e) => {
-                                        warn!("pushto() qd={:?}: {:?}", qd, &e);
-                                        (qd, OperationResult::Failed(e))
-                                    },
-                                }
-                            });
-                            let task_id: String = format!("Catnap::pushto for qd={:?}", qd);
-                            let task: OperationTask = OperationTask::new(task_id, Box::pin(coroutine));
-                            let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                                Some(handle) => handle,
-                                None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                            };
-                            // Borrow the scheduler handle and yielder handle to register a way to wake the coroutine.
-                            queue.add_pending_op(&handle, &yielder_handle);
-                            Ok(handle.get_task_id().into())
-                        },
-                        None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
-                    },
-                    None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
-                }
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::pushto for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().pushto_coroutine(qd, buf, remote, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
+        };
+
+        queue.push(coroutine_constructor)
+    }
+
+    /// Asynchronous code to pushto [buf] to [remote] on a SharedCatnapQueue and its underlying POSIX socket. This function
+    /// returns a coroutine that runs asynchronously to pushto a queue and its underlying POSIX socket and performs any
+    /// necessary multi-queue operations at the libOS-level after the pushto succeeds or fails.
+    async fn pushto_coroutine(
+        self,
+        qd: QDesc,
+        mut buf: DemiBuffer,
+        remote: SocketAddr,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for push to complete.
+        match queue.push_coroutine(&mut buf, Some(remote), yielder).await {
+            Ok(()) => (qd, OperationResult::Push),
+            Err(e) => {
+                warn!("pushto() qd={:?}: {:?}", qd, &e);
+                (qd, OperationResult::Failed(e))
             },
-            Err(e) => Err(e),
         }
     }
 
-    /// Pops data from a socket.
+    /// Synchronous code to pop data from a SharedCatnapQueue and its underlying POSIX socket of optional [size]. This
+    /// function schedules the asynchronous coroutine and performs any necessary synchronous, multi-queue operations
+    /// at the libOS-level before beginning the pop.
     pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::pop");
         trace!("pop() qd={:?}, size={:?}", qd, size);
 
         // We just assert 'size' here, because it was previously checked at PDPIX layer.
         debug_assert!(size.is_none() || ((size.unwrap() > 0) && (size.unwrap() <= limits::POP_SIZE_MAX)));
 
-        // Issue pop operation.
-        match self.qtable.borrow_mut().get_mut(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    let yielder: Yielder = Yielder::new();
-                    let yielder_handle: YielderHandle = yielder.get_handle();
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        // Wait for pop to complete.
-                        let result: Result<(Option<SocketAddrV4>, DemiBuffer), Fail> =
-                            pop_coroutine(fd, size, yielder).await;
-                        // Process result.
-                        match result {
-                            Ok((addr, buf)) => (qd, OperationResult::Pop(addr, buf)),
-                            Err(e) => {
-                                warn!("pop() qd={:?}: {:?}", qd, &e);
-                                (qd, OperationResult::Failed(e))
-                            },
-                        }
-                    });
-                    let task_id: String = format!("Catnap::pop for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, Box::pin(coroutine));
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-                    // Borrow the scheduler handle and yielder handle to register a way to wake the coroutine.
-                    queue.add_pending_op(&handle, &yielder_handle);
-                    let qt: QToken = handle.get_task_id().into();
-                    Ok(qt)
-                },
-                None => unreachable!("CatnapQueue has invalid underlying file descriptor"),
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::pop for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().pop_coroutine(qd, size, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
+        };
+
+        queue.pop(coroutine_constructor)
+    }
+
+    /// Asynchronous code to pop data from a SharedCatnapQueue and its underlying POSIX socket of optional [size]. This
+    /// function returns a coroutine that asynchronously runs pop and performs any necessary multi-queue operations at
+    /// the libOS-level after the pop succeeds or fails.
+    async fn pop_coroutine(self, qd: QDesc, size: Option<usize>, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+
+        // Wait for pop to complete.
+        match queue.pop_coroutine(size, yielder).await {
+            // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+            Ok((Some(addr), buf)) => (
+                qd,
+                OperationResult::Pop(Some(unwrap_socketaddr(addr).expect("we only support IPv4")), buf),
+            ),
+            Ok((None, buf)) => (qd, OperationResult::Pop(None, buf)),
+            Err(e) => {
+                warn!("pop() qd={:?}: {:?}", qd, &e);
+                (qd, OperationResult::Failed(e))
             },
-            None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
         }
     }
 
-    pub fn poll(&self) {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::poll");
-        self.runtime.scheduler.poll()
+    pub fn poll(&mut self) {
+        self.runtime.poll()
     }
 
-    pub fn schedule(&mut self, qt: QToken) -> Result<TaskHandle, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::schedule");
-        match self.runtime.scheduler.from_task_id(qt.into()) {
-            Some(handle) => Ok(handle),
-            None => return Err(Fail::new(libc::EINVAL, "invalid queue token")),
-        }
+    pub fn schedule(&self, qt: QToken) -> Result<TaskHandle, Fail> {
+        self.runtime.from_task_id(qt)
     }
 
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::pack_result");
-        let (qd, r): (QDesc, OperationResult) = self.take_result(handle);
-        Ok(pack_result(&self.runtime, r, qd, qt.into()))
+        self.runtime.remove_coroutine_and_get_result(&handle, qt.into())
     }
 
     /// Allocates a scatter-gather array.
     pub fn sgaalloc(&self, size: usize) -> Result<demi_sgarray_t, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnap::sgaalloc");
         trace!("sgalloc() size={:?}", size);
         self.runtime.alloc_sgarray(size)
     }
 
     /// Frees a scatter-gather array.
     pub fn sgafree(&self, sga: demi_sgarray_t) -> Result<(), Fail> {
-        #[cfg(feature = "sgafree")]
-        timer!("catnap::sgafree");
         trace!("sgafree()");
         self.runtime.free_sgarray(sga)
     }
 
-    /// Takes out the result from the [OperationTask] associated with the target [TaskHandle].
-    fn take_result(&mut self, handle: TaskHandle) -> (QDesc, OperationResult) {
-        #[cfg(feature = "take_result")]
-        timer!("catnap::take_result");
-        let task: OperationTask = if let Some(task) = self.runtime.scheduler.remove(&handle) {
-            OperationTask::from(task.as_any())
-        } else {
-            panic!("Removing task that does not exist (either was previously removed or never inserted)");
-        };
-
-        let (qd, result): (QDesc, OperationResult) = task.get_result().expect("The coroutine has not finished");
-        match result {
-            OperationResult::Close => {},
-            _ => {
-                match self.qtable.borrow_mut().get_mut(&qd) {
-                    Some(queue) => queue.remove_pending_op(&handle),
-                    None => debug!("Catnap::take_result() qd={:?}, This queue was closed", qd),
-                };
-            },
-        }
-
-        (qd, result)
+    /// This function gets a shared queue reference out of the I/O queue table. The type if a ref counted pointer to the
+    /// queue itself.
+    fn get_shared_queue(&self, qd: &QDesc) -> Result<SharedCatnapQueue, Fail> {
+        self.runtime.get_shared_queue::<SharedCatnapQueue>(qd)
     }
 }
 
@@ -790,96 +532,31 @@ impl CatnapLibOS {
 impl Drop for CatnapLibOS {
     // Releases all sockets allocated by Catnap.
     fn drop(&mut self) {
-        for (_, queue) in self.qtable.borrow().get_values() {
-            if let Some(fd) = queue.get_fd() {
-                if unsafe { libc::close(fd) } != 0 {
-                    let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                    error!("close() failed (error={:?}", errno);
-                    warn!("leaking fd={:?}", fd);
-                }
+        for boxed_queue in self.runtime.get_mut_qtable().drain() {
+            match downcast_queue::<SharedCatnapQueue>(boxed_queue) {
+                Ok(mut queue) => {
+                    if let Err(e) = queue.close() {
+                        error!("close() failed (error={:?}", e);
+                    }
+                },
+                Err(_) => {
+                    error!("drop(): attempting to drop something that is not a SharedCatnapQueue");
+                },
             }
         }
     }
 }
 
-//==============================================================================
-// Standalone Functions
-//==============================================================================
+impl Deref for SharedCatnapLibOS {
+    type Target = CatnapLibOS;
 
-/// Packs a [OperationResult] into a [demi_qresult_t].
-fn pack_result(rt: &PosixRuntime, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
-    match result {
-        OperationResult::Connect => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Accept((new_qd, addr)) => {
-            let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&addr);
-            let qr_value: demi_qr_value_t = demi_qr_value_t {
-                ares: demi_accept_result_t {
-                    qd: new_qd.into(),
-                    addr: saddr,
-                },
-            };
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_ACCEPT,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: 0,
-                qr_value,
-            }
-        },
-        OperationResult::Push => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Pop(addr, bytes) => match rt.into_sgarray(bytes) {
-            Ok(mut sga) => {
-                if let Some(addr) = addr {
-                    sga.sga_addr = linux::socketaddrv4_to_sockaddr(&addr);
-                }
-                let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_POP,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: 0,
-                    qr_value,
-                }
-            },
-            Err(e) => {
-                warn!("Operation Failed: {:?}", e);
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: e.errno as i64,
-                    qr_value: unsafe { mem::zeroed() },
-                }
-            },
-        },
-        OperationResult::Close => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Failed(e) => {
-            warn!("Operation Failed: {:?}", e);
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: e.errno as i64,
-                qr_value: unsafe { mem::zeroed() },
-            }
-        },
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl DerefMut for SharedCatnapLibOS {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
     }
 }

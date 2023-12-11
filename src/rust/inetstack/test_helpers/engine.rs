@@ -2,78 +2,84 @@
 // Licensed under the MIT license.
 
 use crate::{
-    inetstack::protocols::{
-        arp::ArpPeer,
-        ethernet2::{
-            EtherType2,
-            Ethernet2Header,
+    inetstack::{
+        protocols::{
+            arp::SharedArpPeer,
+            ethernet2::{
+                EtherType2,
+                Ethernet2Header,
+            },
+            udp::SharedUdpPeer,
+            Peer,
         },
-        queue::InetQueue,
-        tcp::operations::{
-            AcceptFuture,
-            ConnectFuture,
-            PopFuture,
-            PushFuture,
-        },
-        udp::UdpPopFuture,
-        Peer,
+        ArpConfig,
+        TcpConfig,
+        UdpConfig,
     },
     runtime::{
         fail::Fail,
         memory::DemiBuffer,
-        network::types::MacAddress,
-        queue::IoQueueTable,
-        timer::TimerRc,
+        network::{
+            types::MacAddress,
+            NetworkRuntime,
+        },
+        scheduler::Yielder,
+        Operation,
         QDesc,
+        QToken,
+        SharedBox,
+        SharedObject,
     },
-    scheduler::scheduler::Scheduler,
 };
 use ::libc::EBADMSG;
 use ::std::{
-    cell::RefCell,
     collections::HashMap,
-    future::Future,
     net::{
         Ipv4Addr,
         SocketAddrV4,
     },
-    rc::Rc,
-    time::Duration,
+    ops::{
+        Deref,
+        DerefMut,
+    },
+    pin::Pin,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
-use super::TestRuntime;
+use super::SharedTestRuntime;
 
 pub struct Engine<const N: usize> {
-    pub rt: Rc<TestRuntime>,
-    pub clock: TimerRc,
-    pub arp: ArpPeer<N>,
-    pub ipv4: Peer<N>,
-    pub qtable: Rc<RefCell<IoQueueTable<InetQueue<N>>>>,
+    test_rig: SharedTestRuntime,
+    arp: SharedArpPeer<N>,
+    ipv4: Peer<N>,
 }
 
-impl<const N: usize> Engine<N> {
-    pub fn new(rt: TestRuntime, scheduler: Scheduler, clock: TimerRc) -> Result<Self, Fail> {
-        let rt = Rc::new(rt);
-        let link_addr = rt.link_addr;
-        let ipv4_addr = rt.ipv4_addr;
-        let arp_options = rt.arp_options.clone();
-        let udp_config = rt.udp_config.clone();
-        let tcp_config = rt.tcp_config.clone();
-        let qtable = Rc::new(RefCell::new(IoQueueTable::<InetQueue<N>>::new()));
-        let arp = ArpPeer::new(
-            rt.clone(),
-            scheduler.clone(),
-            clock.clone(),
+#[derive(Clone)]
+pub struct SharedEngine<const N: usize>(SharedObject<Engine<N>>);
+
+impl<const N: usize> SharedEngine<N> {
+    pub fn new(test_rig: SharedTestRuntime) -> Result<Self, Fail> {
+        let link_addr: MacAddress = test_rig.get_link_addr();
+        let ipv4_addr: Ipv4Addr = test_rig.get_ip_addr();
+        let arp_config: ArpConfig = test_rig.get_arp_config();
+        let udp_config: UdpConfig = test_rig.get_udp_config();
+        let tcp_config: TcpConfig = test_rig.get_tcp_config();
+
+        let boxed_test_rig: SharedBox<dyn NetworkRuntime<N>> = SharedBox::new(Box::new(test_rig.clone()));
+        let arp = SharedArpPeer::new(
+            test_rig.get_runtime(),
+            boxed_test_rig.clone(),
             link_addr,
             ipv4_addr,
-            arp_options,
+            arp_config,
         )?;
         let rng_seed: [u8; 32] = [0; 32];
         let ipv4 = Peer::new(
-            rt.clone(),
-            scheduler.clone(),
-            qtable.clone(),
-            clock.clone(),
+            test_rig.get_runtime(),
+            boxed_test_rig.clone(),
             link_addr,
             ipv4_addr,
             udp_config,
@@ -81,19 +87,17 @@ impl<const N: usize> Engine<N> {
             arp.clone(),
             rng_seed,
         )?;
-        Ok(Engine {
-            rt,
-            clock,
-            arp,
-            ipv4,
-            qtable,
-        })
+        Ok(Self(SharedObject::<Engine<N>>::new(Engine { test_rig, arp, ipv4 })))
+    }
+
+    pub fn advance_clock(&mut self, now: Instant) {
+        self.test_rig.advance_clock(now)
     }
 
     pub fn receive(&mut self, bytes: DemiBuffer) -> Result<(), Fail> {
         let (header, payload) = Ethernet2Header::parse(bytes)?;
         debug!("Engine received {:?}", header);
-        if self.rt.link_addr != header.dst_addr() && !header.dst_addr().is_broadcast() {
+        if self.test_rig.get_link_addr() != header.dst_addr() && !header.dst_addr().is_broadcast() {
             return Err(Fail::new(EBADMSG, "physical destination address mismatch"));
         }
         match header.ether_type() {
@@ -103,69 +107,66 @@ impl<const N: usize> Engine<N> {
         }
     }
 
-    pub fn ipv4_ping(
-        &mut self,
-        dest_ipv4_addr: Ipv4Addr,
-        timeout: Option<Duration>,
-    ) -> impl Future<Output = Result<Duration, Fail>> {
-        self.ipv4.ping(dest_ipv4_addr, timeout)
+    pub async fn ipv4_ping(&mut self, dest_ipv4_addr: Ipv4Addr, timeout: Option<Duration>) -> Result<Duration, Fail> {
+        self.ipv4.ping(dest_ipv4_addr, timeout).await
     }
 
-    pub fn udp_pushto(&self, fd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<(), Fail> {
-        self.ipv4.udp.do_pushto(fd, buf, to)
+    pub fn udp_pushto(&self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<Pin<Box<Operation>>, Fail> {
+        let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
+        udp.pushto(qd, buf, to)
     }
 
-    pub fn udp_pop(&mut self, fd: QDesc) -> UdpPopFuture {
-        self.ipv4.udp.do_pop(fd, None)
+    pub fn udp_pop(&self, qd: QDesc) -> Result<Pin<Box<Operation>>, Fail> {
+        let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
+        udp.pop(qd, None)
     }
 
     pub fn udp_socket(&mut self) -> Result<QDesc, Fail> {
-        self.ipv4.udp.do_socket()
+        self.ipv4.udp.socket()
     }
 
     pub fn udp_bind(&mut self, socket_fd: QDesc, endpoint: SocketAddrV4) -> Result<(), Fail> {
-        self.ipv4.udp.do_bind(socket_fd, endpoint)
+        self.ipv4.udp.bind(socket_fd, endpoint)
     }
 
     pub fn udp_close(&mut self, socket_fd: QDesc) -> Result<(), Fail> {
-        self.ipv4.udp.do_close(socket_fd)
+        self.ipv4.udp.close(socket_fd)
     }
 
     pub fn tcp_socket(&mut self) -> Result<QDesc, Fail> {
-        self.ipv4.tcp.do_socket()
+        self.ipv4.tcp.socket()
     }
 
-    pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> ConnectFuture<N> {
-        self.ipv4.tcp.connect(socket_fd, remote_endpoint).unwrap()
+    pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> Result<QToken, Fail> {
+        self.ipv4.tcp.connect(socket_fd, remote_endpoint)
     }
 
     pub fn tcp_bind(&mut self, socket_fd: QDesc, endpoint: SocketAddrV4) -> Result<(), Fail> {
         self.ipv4.tcp.bind(socket_fd, endpoint)
     }
 
-    pub fn tcp_accept(&mut self, fd: QDesc) -> AcceptFuture<N> {
-        let (_, future) = self.ipv4.tcp.do_accept(fd);
-        future
+    pub fn tcp_accept(&mut self, fd: QDesc) -> Result<QToken, Fail> {
+        self.ipv4.tcp.accept(fd)
     }
 
-    pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> PushFuture {
+    pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
         self.ipv4.tcp.push(socket_fd, buf)
     }
 
-    pub fn tcp_pop(&mut self, socket_fd: QDesc) -> PopFuture<N> {
+    pub fn tcp_pop(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
         self.ipv4.tcp.pop(socket_fd, None)
     }
 
-    pub fn tcp_close(&mut self, socket_fd: QDesc) -> Result<(), Fail> {
-        self.ipv4.tcp.do_close(socket_fd)
+    pub fn tcp_async_close(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
+        self.ipv4.tcp.async_close(socket_fd)
     }
 
     pub fn tcp_listen(&mut self, socket_fd: QDesc, backlog: usize) -> Result<(), Fail> {
         self.ipv4.tcp.listen(socket_fd, backlog)
     }
 
-    pub fn arp_query(&self, ipv4_addr: Ipv4Addr) -> impl Future<Output = Result<MacAddress, Fail>> {
-        self.arp.query(ipv4_addr)
+    pub async fn arp_query(&mut self, ipv4_addr: Ipv4Addr) -> Result<MacAddress, Fail> {
+        self.arp.query(ipv4_addr, &Yielder::new()).await
     }
 
     pub fn tcp_mss(&self, handle: QDesc) -> Result<usize, Fail> {
@@ -178,5 +179,23 @@ impl<const N: usize> Engine<N> {
 
     pub fn export_arp_cache(&self) -> HashMap<Ipv4Addr, MacAddress> {
         self.arp.export_cache()
+    }
+
+    pub fn get_test_rig(&self) -> SharedTestRuntime {
+        self.test_rig.clone()
+    }
+}
+
+impl<const N: usize> Deref for SharedEngine<N> {
+    type Target = Engine<N>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<const N: usize> DerefMut for SharedEngine<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
     }
 }

@@ -19,7 +19,7 @@ use ::demikernel::{
 };
 use ::std::{
     env,
-    net::SocketAddrV4,
+    net::SocketAddr,
     slice,
     str::FromStr,
 };
@@ -28,7 +28,7 @@ use ::std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_DGRAM: i32 = windows::Win32::Networking::WinSock::SOCK_DGRAM as i32;
+pub const SOCK_DGRAM: i32 = windows::Win32::Networking::WinSock::SOCK_DGRAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -128,7 +128,7 @@ impl UdpServer {
         });
     }
 
-    pub fn run(&mut self, local: SocketAddrV4, remote: SocketAddrV4, fill_char: u8) -> Result<()> {
+    pub fn run(&mut self, local: SocketAddr, remote: SocketAddr, fill_char: u8) -> Result<()> {
         if let Err(e) = self.libos.bind(self.sockqd, local) {
             anyhow::bail!("bind failed: {:?}", e)
         };
@@ -220,8 +220,8 @@ impl UdpClient {
 
     pub fn run(
         &mut self,
-        local: SocketAddrV4,
-        remote: SocketAddrV4,
+        local: SocketAddr,
+        remote: SocketAddr,
         fill_char: u8,
         buffer_size: usize,
         npings: usize,
@@ -351,8 +351,8 @@ pub fn main() -> Result<()> {
             Err(e) => anyhow::bail!("failed to initialize libos: {:?}", e),
         };
 
-        let local: SocketAddrV4 = SocketAddrV4::from_str(&args[2])?;
-        let remote: SocketAddrV4 = SocketAddrV4::from_str(&args[3])?;
+        let local: SocketAddr = SocketAddr::from_str(&args[2])?;
+        let remote: SocketAddr = SocketAddr::from_str(&args[3])?;
 
         if args[1] == "--server" {
             let mut server: UdpServer = UdpServer::new(libos)?;

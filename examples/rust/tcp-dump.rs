@@ -26,7 +26,7 @@ use ::demikernel::{
     QToken,
 };
 use ::std::{
-    net::SocketAddrV4,
+    net::SocketAddr,
     str::FromStr,
     time::{
         Duration,
@@ -38,7 +38,7 @@ use ::std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -54,7 +54,7 @@ pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
 #[derive(Debug)]
 pub struct ProgramArguments {
     /// Local socket IPv4 address.
-    local: SocketAddrV4,
+    local: SocketAddr,
 }
 
 /// Associate functions for Program Arguments
@@ -79,7 +79,7 @@ impl ProgramArguments {
 
         // Default arguments.
         let mut args: ProgramArguments = ProgramArguments {
-            local: SocketAddrV4::from_str(Self::DEFAULT_LOCAL)?,
+            local: SocketAddr::from_str(Self::DEFAULT_LOCAL)?,
         };
 
         // Local address.
@@ -91,13 +91,13 @@ impl ProgramArguments {
     }
 
     /// Returns the local endpoint address parameter stored in the target program arguments.
-    pub fn get_local(&self) -> SocketAddrV4 {
+    pub fn get_local(&self) -> SocketAddr {
         self.local
     }
 
     /// Sets the local address and port number parameters in the target program arguments.
     fn set_local_addr(&mut self, addr: &str) -> Result<()> {
-        self.local = SocketAddrV4::from_str(addr)?;
+        self.local = SocketAddr::from_str(addr)?;
         Ok(())
     }
 }
@@ -122,7 +122,7 @@ impl Application {
     /// Instantiates the application.
     pub fn new(mut libos: LibOS, args: &ProgramArguments) -> Result<Self> {
         // Extract arguments.
-        let local: SocketAddrV4 = args.get_local();
+        let local: SocketAddr = args.get_local();
 
         // Create TCP socket.
         let sockqd: QDesc = match libos.socket(AF_INET, SOCK_STREAM, 0) {

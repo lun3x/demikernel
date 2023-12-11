@@ -13,7 +13,7 @@ use ::demikernel::{
     QToken,
 };
 use ::std::{
-    net::SocketAddrV4,
+    net::SocketAddr,
     time::Duration,
 };
 
@@ -25,7 +25,7 @@ use ::std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -38,7 +38,7 @@ pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
 //======================================================================================================================
 
 /// Drives integration tests for close() on TCP sockets.
-pub fn run(libos: &mut LibOS, addr: &SocketAddrV4) -> Vec<(String, String, Result<(), anyhow::Error>)> {
+pub fn run(libos: &mut LibOS, addr: &SocketAddr) -> Vec<(String, String, Result<(), anyhow::Error>)> {
     let mut result: Vec<(String, String, Result<(), anyhow::Error>)> = Vec::new();
 
     crate::collect!(result, crate::test!(wait_after_close_accepting_socket(libos, addr)));
@@ -65,7 +65,7 @@ pub fn run(libos: &mut LibOS, addr: &SocketAddrV4) -> Vec<(String, String, Resul
 }
 
 // Attempts to close a TCP socket that is accepting and then waits on the qtoken.
-fn wait_after_close_accepting_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn wait_after_close_accepting_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create an accepting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, *local)?;
@@ -101,7 +101,7 @@ fn wait_after_close_accepting_socket(libos: &mut LibOS, local: &SocketAddrV4) ->
 }
 
 /// Attempts to close a TCP socket that is connecting and then waits on the qtoken.
-fn wait_after_close_connecting_socket(libos: &mut LibOS, remote: &SocketAddrV4) -> Result<()> {
+fn wait_after_close_connecting_socket(libos: &mut LibOS, remote: &SocketAddr) -> Result<()> {
     // Create a connecting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     let qt: QToken = libos.connect(sockqd, *remote)?;
@@ -143,7 +143,7 @@ fn wait_after_close_connecting_socket(libos: &mut LibOS, remote: &SocketAddrV4) 
 }
 
 // Attempts to close a TCP socket that is accepting and then waits on the queue token.
-fn wait_after_async_close_accepting_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn wait_after_async_close_accepting_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create an accepting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, *local)?;
@@ -174,6 +174,7 @@ fn wait_after_async_close_accepting_socket(libos: &mut LibOS, local: &SocketAddr
     // Poll again to check that the accept() co-routine completed with an error and was properly canceled.
     match libos.wait(qt, Some(Duration::from_micros(0))) {
         Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+        Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
         // If we found a connection to accept, something has gone wrong.
         Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_ACCEPT && qr.qr_ret == 0 => {
             anyhow::bail!("accept() should not succeed because remote should not be connecting")
@@ -186,7 +187,7 @@ fn wait_after_async_close_accepting_socket(libos: &mut LibOS, local: &SocketAddr
 }
 
 /// Attempts to close a TCP socket that is connecting and then waits on the queue token.
-fn wait_after_async_close_connecting_socket(libos: &mut LibOS, remote: &SocketAddrV4) -> Result<()> {
+fn wait_after_async_close_connecting_socket(libos: &mut LibOS, remote: &SocketAddr) -> Result<()> {
     // Create a connecting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     let qt: QToken = libos.connect(sockqd, *remote)?;
@@ -222,6 +223,8 @@ fn wait_after_async_close_connecting_socket(libos: &mut LibOS, remote: &SocketAd
         match libos.wait(qt, Some(Duration::from_micros(0))) {
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECONNREFUSED as i64 => {},
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+            Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
+            Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECONNABORTED as i64 => {},
             // If connect() completes successfully, something has gone wrong.
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_CONNECT && qr.qr_ret == 0 => {
                 anyhow::bail!("connect() should not succeed because remote does not exist")
@@ -254,7 +257,7 @@ fn wait_on_invalid_queue_token_returns_einval(libos: &mut LibOS) -> Result<()> {
 }
 
 // Attempt to wait for an accept() operation to complete after issuing an asynchronous close on a socket.
-fn wait_for_accept_after_issuing_async_close(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn wait_for_accept_after_issuing_async_close(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create an accepting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, *local)?;
@@ -269,6 +272,7 @@ fn wait_for_accept_after_issuing_async_close(libos: &mut LibOS, local: &SocketAd
         Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_ACCEPT && qr.qr_ret == 0 => {
             anyhow::bail!("accept() should not succeed because remote should not be connecting")
         },
+        Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
         Ok(_) => anyhow::bail!("wait() should not succeed with accept()"),
         Err(_) => anyhow::bail!("wait() should timeout with accept()"),
     }
@@ -285,6 +289,10 @@ fn wait_for_accept_after_issuing_async_close(libos: &mut LibOS, local: &SocketAd
         Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {
             accepted_completed = true
         },
+        Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {
+            accepted_completed = true
+        },
+
         Ok(_) => anyhow::bail!("wait() should not succeed with accept()"),
         Err(_) => anyhow::bail!("wait() should timeout with accept()"),
     }
@@ -296,10 +304,11 @@ fn wait_for_accept_after_issuing_async_close(libos: &mut LibOS, local: &SocketAd
         Err(_) => anyhow::bail!("wait() should succeed with async_close()"),
     }
 
-    // Wait again on accept() and ensure that ECANCELED is returned this time.
+    // Wait again on accept() and ensure it fails or gets cancelled.
     if !accepted_completed {
         match libos.wait(qt, Some(Duration::from_micros(0))) {
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+            Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
             // If we found a connection to accept, something has gone wrong.
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_ACCEPT && qr.qr_ret == 0 => {
                 anyhow::bail!("accept() should not succeed because remote should not be connecting")
@@ -313,7 +322,7 @@ fn wait_for_accept_after_issuing_async_close(libos: &mut LibOS, local: &SocketAd
 }
 
 // Attempt to wait for a connect() operation to complete complete after asynchronous close on a socket.
-fn wait_for_connect_after_issuing_async_close(libos: &mut LibOS, remote: &SocketAddrV4) -> Result<()> {
+fn wait_for_connect_after_issuing_async_close(libos: &mut LibOS, remote: &SocketAddr) -> Result<()> {
     // Create a connecting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     let qt: QToken = libos.connect(sockqd, *remote)?;
@@ -337,10 +346,11 @@ fn wait_for_connect_after_issuing_async_close(libos: &mut LibOS, remote: &Socket
     let qt_close: QToken = libos.async_close(sockqd)?;
 
     if !connect_finished {
-        // Poll again to check that the connect() co-routine completed with an error, either canceled or refused.
+        // Wait again on connect() and ensure it fails or gets cancelled.
         match libos.wait(qt, Some(Duration::from_micros(0))) {
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECONNREFUSED as i64 => {},
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+            Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
             // If connect() completes successfully, something has gone wrong.
             Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_CONNECT && qr.qr_ret == 0 => {
                 anyhow::bail!("connect() should not succeed because remote does not exist")

@@ -18,8 +18,6 @@ mod pal;
 #[cfg(feature = "profiler")]
 pub mod perftools;
 
-pub mod scheduler;
-
 pub mod runtime;
 
 pub mod inetstack;
@@ -41,11 +39,8 @@ mod catpowder;
 #[cfg(feature = "catcollar-libos")]
 mod catcollar;
 
-#[cfg(all(feature = "catnap-libos", target_os = "linux"))]
+#[cfg(all(feature = "catnap-libos"))]
 mod catnap;
-
-#[cfg(all(feature = "catnapw-libos", target_os = "windows"))]
-mod catnapw;
 
 #[cfg(feature = "catmem-libos")]
 mod catmem;
@@ -85,7 +80,7 @@ macro_rules! ensure_eq {
         match (&$left, &$right) {
             (left_val, right_val) => {
                 if !(*left_val == *right_val) {
-                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`,right: `{:?}`"#, left_val, right_val)
+                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`, right: `{:?}` at file: {}, line: {}"#, left_val, right_val, file!(), line!())
                 }
             }
         }
@@ -97,7 +92,7 @@ macro_rules! ensure_eq {
         match (&($left), &($right)) {
             (left_val, right_val) => {
                 if !(*left_val == *right_val) {
-                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`, right: `{:?}`: {}"#, left_val, right_val, format_args!($($arg)+))
+                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`, right: `{:?}`: {} at file: {}, line: {}"#, left_val, right_val, format_args!($($arg)+), file!(), line!())
                 }
             }
         }
@@ -111,7 +106,7 @@ macro_rules! ensure_neq {
         match (&$left, &$right) {
             (left_val, right_val) => {
                 if (*left_val == *right_val) {
-                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`,right: `{:?}`"#, left_val, right_val)
+                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`, right: `{:?}` at file: {}, line: {}"#, left_val, right_val, file!(), line!())
                 }
             }
         }
@@ -123,7 +118,7 @@ macro_rules! ensure_neq {
         match (&($left), &($right)) {
             (left_val, right_val) => {
                 if (*left_val == *right_val) {
-                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`, right: `{:?}`: {}"#, left_val, right_val, format_args!($($arg)+))
+                    anyhow::bail!(r#"ensure failed: `(left == right)` left: `{:?}`, right: `{:?}`: {} at file: {}, line: {}"#, left_val, right_val, format_args!($($arg)+), file!(), line!())
                 }
             }
         }

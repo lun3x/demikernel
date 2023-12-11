@@ -28,41 +28,60 @@ catloop:
   tcp_echo:
     scenario0:
       bufsize: 64
-      nclients: 32
+      nclients: 1
       nrequests: 100
       run_mode: sequential
     scenario1:
       bufsize: 1024
-      nclients: 32
+      nclients: 1
       nrequests: 100
       run_mode: sequential
     scenario2:
       bufsize: 64
-      nclients: 32
+      nclients: 1
       nrequests: 100
       run_mode: concurrent
     scenario3:
       bufsize: 1024
-      nclients: 32
+      nclients: 1
       nrequests: 100
       run_mode: concurrent
   tcp_close:
     scenario0:
-      nclients: 32
+      nclients: 1
       run_mode: sequential
       who_closes: client
     scenario1:
-      nclients: 32
+      nclients: 1
       run_mode: sequential
       who_closes: server
     scenario2:
-      nclients: 32
+      nclients: 1
       run_mode: concurrent
       who_closes: client
     scenario3:
-      nclients: 32
+      nclients: 1
       run_mode: concurrent
       who_closes: server
+  tcp_wait:
+    scenario0:
+      nclients: 1
+      scenario: push_close_wait
+    scenario1:
+      nclients: 1
+      scenario: push_async_close_wait
+    scenario2:
+      nclients: 1
+      scenario: push_async_close_pending_wait
+    scenario3:
+      nclients: 1
+      scenario: pop_close_wait
+    scenario4:
+      nclients: 1
+      scenario: pop_async_close_wait
+    scenario5:
+      nclients: 1
+      scenario: pop_async_close_pending_wait
   tcp_ping_pong: {}
   tcp_push_pop: {}
 catnap:
@@ -132,7 +151,50 @@ catnip:
   tcp_push_pop: {}
   udp_ping_pong: {}
   udp_push_pop: {}
+  tcp_echo:
+    scenario0:
+      bufsize: 64
+      nclients: 1
+      nrequests: 100
+      run_mode: sequential
+    scenario1:
+      bufsize: 1024
+      nclients: 1
+      nrequests: 100
+      run_mode: sequential
+    scenario2:
+      bufsize: 64
+      nclients: 1
+      nrequests: 100
+      run_mode: concurrent
+    scenario3:
+      bufsize: 1024
+      nclients: 1
+      nrequests: 100
+      run_mode: concurrent
 catpowder:
   tcp_ping_pong: {}
+  tcp_push_pop: {}
   udp_ping_pong: {}
   udp_push_pop: {}
+  tcp_echo:
+    scenario0:
+      bufsize: 64
+      nclients: 1
+      nrequests: 100
+      run_mode: sequential
+    scenario1:
+      bufsize: 1024
+      nclients: 1
+      nrequests: 100
+      run_mode: sequential
+    scenario2:
+      bufsize: 64
+      nclients: 1
+      nrequests: 100
+      run_mode: concurrent
+    scenario3:
+      bufsize: 1024
+      nclients: 1
+      nrequests: 100
+      run_mode: concurrent

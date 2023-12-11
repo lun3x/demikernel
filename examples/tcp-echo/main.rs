@@ -3,8 +3,8 @@
 
 #![cfg_attr(feature = "strict", deny(warnings))]
 #![deny(clippy::all)]
-#![feature(drain_filter)]
-#![feature(hash_drain_filter)]
+#![feature(extract_if)]
+#![feature(hash_extract_if)]
 
 //======================================================================================================================
 // Imports
@@ -23,7 +23,7 @@ use demikernel::{
 };
 use server::TcpEchoServer;
 use std::{
-    net::SocketAddrV4,
+    net::SocketAddr,
     str::FromStr,
 };
 
@@ -31,7 +31,7 @@ use std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -52,7 +52,7 @@ pub struct ProgramArguments {
     /// Run mode.
     run_mode: Option<String>,
     /// Socket IPv4 address.
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     /// Buffer size (in bytes).
     bufsize: Option<usize>,
     /// Number of requests.
@@ -132,9 +132,9 @@ impl ProgramArguments {
             .get_matches();
 
         // Socket address.
-        let addr: SocketAddrV4 = {
+        let addr: SocketAddr = {
             let addr: &String = matches.get_one::<String>("addr").expect("missing address");
-            SocketAddrV4::from_str(addr)?
+            SocketAddr::from_str(addr)?
         };
 
         // Default arguments.

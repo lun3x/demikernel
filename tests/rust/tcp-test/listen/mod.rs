@@ -13,7 +13,7 @@ use demikernel::{
     QToken,
 };
 use std::{
-    net::SocketAddrV4,
+    net::SocketAddr,
     time::Duration,
 };
 
@@ -25,13 +25,19 @@ use std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
+
+#[cfg(target_os = "windows")]
+pub const SOMAXCONN: i32 = windows::Win32::Networking::WinSock::SOMAXCONN as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
 
 #[cfg(target_os = "linux")]
 pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
+
+#[cfg(target_os = "linux")]
+pub const SOMAXCONN: i32 = libc::SOMAXCONN;
 
 //======================================================================================================================
 // Standalone Functions
@@ -40,8 +46,8 @@ pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
 /// Drives integration tests for listen() on TCP sockets.
 pub fn run(
     libos: &mut LibOS,
-    local: &SocketAddrV4,
-    remote: &SocketAddrV4,
+    local: &SocketAddr,
+    remote: &SocketAddr,
 ) -> Vec<(String, String, Result<(), anyhow::Error>)> {
     let mut result: Vec<(String, String, Result<(), anyhow::Error>)> = Vec::new();
 
@@ -87,7 +93,7 @@ fn listen_unbound_socket(libos: &mut LibOS) -> Result<()> {
 }
 
 /// Attempts to listen for connections on a TCP socket that is bound.
-fn listen_bound_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn listen_bound_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a bound socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;
@@ -102,7 +108,7 @@ fn listen_bound_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
 }
 
 /// Attempts to listen for connections on a TCP socket with a zero backlog length.
-fn listen_invalid_zero_backlog_length(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn listen_invalid_zero_backlog_length(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a bound socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;
@@ -120,13 +126,13 @@ fn listen_invalid_zero_backlog_length(libos: &mut LibOS, local: &SocketAddrV4) -
 }
 
 /// Attempts to listen for connections on a TCP socket with a large backlog length.
-fn listen_large_backlog_length(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn listen_large_backlog_length(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a bound socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;
 
     // Backlog length.
-    let backlog: usize = (libc::SOMAXCONN + 1) as usize;
+    let backlog: usize = (SOMAXCONN + 1) as usize;
 
     // Succeed to listen().
     libos.listen(sockqd, backlog)?;
@@ -138,7 +144,7 @@ fn listen_large_backlog_length(libos: &mut LibOS, local: &SocketAddrV4) -> Resul
 }
 
 /// Attempts to listen for connections on a TCP socket that is already listening for connections.
-fn listen_listening_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn listen_listening_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a bound socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;
@@ -160,7 +166,7 @@ fn listen_listening_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()
 }
 
 /// Attempts to listen for connections on a TCP socket that is connecting.
-fn listen_connecting_socket(libos: &mut LibOS, local: &SocketAddrV4, remote: &SocketAddrV4) -> Result<()> {
+fn listen_connecting_socket(libos: &mut LibOS, local: &SocketAddr, remote: &SocketAddr) -> Result<()> {
     // Create a connecting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;
@@ -181,11 +187,14 @@ fn listen_connecting_socket(libos: &mut LibOS, local: &SocketAddrV4, remote: &So
         Err(_) => anyhow::bail!("wait() should timeout"),
     }
 
-    // Fail to listen().
-    // TODO: Not sure if we should be able to listen after a failed connect().
+    // Fail to listen(). Socket should be closed.
     if connect_finished {
         // Succeed to listen().
-        libos.listen(sockqd, 16)?;
+        match libos.listen(sockqd, 16) {
+            Err(e) if e.errno == libc::EBADF => (),
+            Err(e) => anyhow::bail!("listen() failed with {}", e),
+            Ok(()) => anyhow::bail!("listen() on a socket that is connecting should fail"),
+        };
     } else {
         match libos.listen(sockqd, 16) {
             Err(e) if e.errno == libc::EADDRINUSE => (),
@@ -215,7 +224,7 @@ fn listen_connecting_socket(libos: &mut LibOS, local: &SocketAddrV4, remote: &So
 }
 
 /// Attempts to listen for connections on a TCP socket that is accepting connections.
-fn listen_accepting_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn listen_accepting_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create an accepting socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;
@@ -258,7 +267,7 @@ fn listen_accepting_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()
 }
 
 /// Attempts to listen for connections on a TCP socket that is closed.
-fn listen_closed_socket(libos: &mut LibOS, local: &SocketAddrV4) -> Result<()> {
+fn listen_closed_socket(libos: &mut LibOS, local: &SocketAddr) -> Result<()> {
     // Create a bound socket.
     let sockqd: QDesc = libos.socket(AF_INET, SOCK_STREAM, 0)?;
     libos.bind(sockqd, local.to_owned())?;

@@ -17,7 +17,7 @@ use ::demikernel::{
     QToken,
 };
 use ::std::{
-    net::SocketAddrV4,
+    net::SocketAddr,
     slice,
 };
 
@@ -29,7 +29,7 @@ use ::std::{
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
 
 #[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM as i32;
+pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
 
 #[cfg(target_os = "linux")]
 pub const AF_INET: i32 = libc::AF_INET;
@@ -45,7 +45,7 @@ pub struct TcpClient {
     /// Underlying libOS.
     libos: LibOS,
     /// Address of remote peer.
-    remote: SocketAddrV4,
+    remote: SocketAddr,
     /// Number of clients.
     nclients: usize,
     /// Socket queue descriptor.
@@ -57,7 +57,7 @@ pub struct TcpClient {
 //======================================================================================================================
 
 impl TcpClient {
-    pub fn new(libos: LibOS, remote: SocketAddrV4, nclients: usize) -> Result<Self> {
+    pub fn new(libos: LibOS, remote: SocketAddr, nclients: usize) -> Result<Self> {
         println!("Connecting to: {:?}", remote);
         Ok(Self {
             libos,
@@ -85,6 +85,7 @@ impl TcpClient {
             match self.libos.wait(push_qt, None) {
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_PUSH && qr.qr_ret == 0 => {},
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
                 _ => anyhow::bail!("wait() should succeed with push() after async_close()"),
             }
         }
@@ -123,6 +124,7 @@ impl TcpClient {
                     }
                 },
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
                 Ok(_) => anyhow::bail!("wait() should not succeed with pop() after close()"),
                 Err(_) => anyhow::bail!("wait() should not fail"),
             }
@@ -148,6 +150,7 @@ impl TcpClient {
             match self.libos.wait(push_qt, None) {
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_PUSH && qr.qr_ret == 0 => {},
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
                 _ => anyhow::bail!("wait() should not succeed with push() after close()"),
             }
         }
@@ -186,6 +189,7 @@ impl TcpClient {
                     }
                 },
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
                 Ok(_) => anyhow::bail!("wait() should not succeed with pop() after close()"),
                 Err(_) => anyhow::bail!("wait() should not fail"),
             }
@@ -205,6 +209,7 @@ impl TcpClient {
             match self.libos.wait(push_qt, None) {
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_PUSH && qr.qr_ret == 0 => {},
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::EBADF as i64 => {},
                 _ => anyhow::bail!("wait() should succeed with push() after issuing async_close()"),
             }
 
@@ -244,7 +249,7 @@ impl TcpClient {
                         anyhow::bail!("pop() should not sucessfully receive any data");
                     }
                 },
-                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && qr.qr_ret == libc::ECANCELED as i64 => {},
+                Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_FAILED && is_closed(qr.qr_ret) => {},
                 Ok(_) => anyhow::bail!("wait() should not succeed with pop() after close()"),
                 Err(_) => anyhow::bail!("wait() should not fail"),
             }
@@ -302,6 +307,17 @@ impl TcpClient {
             qr_opcode => anyhow::bail!("unexpected result (qr_opcode={:?})", qr_opcode),
         }
         Ok(())
+    }
+}
+
+//======================================================================================================================
+// Standalone functions
+//======================================================================================================================
+
+fn is_closed(ret: i64) -> bool {
+    match ret as i32 {
+        libc::ECONNRESET | libc::ENOTCONN | libc::ECANCELED | libc::EBADF => true,
+        _ => false,
     }
 }
 

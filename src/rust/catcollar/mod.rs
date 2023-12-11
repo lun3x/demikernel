@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-mod futures;
 mod iouring;
 mod queue;
 mod runtime;
@@ -12,24 +11,20 @@ mod runtime;
 
 pub use self::{
     queue::CatcollarQueue,
-    runtime::IoUringRuntime,
+    runtime::{
+        RequestId,
+        SharedIoUringRuntime,
+    },
 };
 
 //======================================================================================================================
 // Imports
 //======================================================================================================================
 
-use self::futures::{
-    accept::AcceptFuture,
-    close::CloseFuture,
-    connect::ConnectFuture,
-    pop::PopFuture,
-    push::PushFuture,
-    pushto::PushtoFuture,
-};
 use crate::{
     demikernel::config::Config,
     pal::{
+        constants::SOMAXCONN,
         data_structures::{
             SockAddr,
             SockAddrIn,
@@ -44,35 +39,34 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
+        network::unwrap_socketaddr,
         queue::{
-            IoQueueTable,
             Operation,
             OperationResult,
-            OperationTask,
             QDesc,
             QToken,
             QType,
         },
+        scheduler::{
+            TaskHandle,
+            Yielder,
+        },
         types::{
-            demi_accept_result_t,
-            demi_opcode_t,
-            demi_qr_value_t,
             demi_qresult_t,
             demi_sgarray_t,
         },
+        DemiRuntime,
+        SharedDemiRuntime,
     },
-    scheduler::TaskHandle,
 };
 use ::std::{
-    cell::{
-        RefCell,
-        RefMut,
-    },
     mem,
-    net::SocketAddrV4,
+    net::{
+        SocketAddr,
+        SocketAddrV4,
+    },
     os::unix::prelude::RawFd,
     pin::Pin,
-    rc::Rc,
 };
 
 //======================================================================================================================
@@ -81,10 +75,10 @@ use ::std::{
 
 /// Catcollar LibOS
 pub struct CatcollarLibOS {
-    /// Table of queue descriptors.
-    qtable: Rc<RefCell<IoQueueTable<CatcollarQueue>>>, // TODO: Move this into runtime module.
+    /// Shared DemiRuntime.
+    runtime: SharedDemiRuntime,
     /// Underlying runtime.
-    runtime: IoUringRuntime,
+    transport: SharedIoUringRuntime,
 }
 
 //======================================================================================================================
@@ -94,11 +88,9 @@ pub struct CatcollarLibOS {
 /// Associate Functions for Catcollar LibOS
 impl CatcollarLibOS {
     /// Instantiates a Catcollar LibOS.
-    pub fn new(_config: &Config) -> Self {
-        let qtable: Rc<RefCell<IoQueueTable<CatcollarQueue>>> =
-            Rc::new(RefCell::new(IoQueueTable::<CatcollarQueue>::new()));
-        let runtime: IoUringRuntime = IoUringRuntime::new();
-        Self { qtable, runtime }
+    pub fn new(_config: &Config, runtime: SharedDemiRuntime) -> Self {
+        let transport: SharedIoUringRuntime = SharedIoUringRuntime::default();
+        Self { runtime, transport }
     }
 
     /// Creates a socket.
@@ -145,7 +137,7 @@ impl CatcollarLibOS {
                 trace!("socket: {:?}, domain: {:?}, typ: {:?}", fd, domain, typ);
                 let mut queue: CatcollarQueue = CatcollarQueue::new(qtype);
                 queue.set_fd(fd);
-                Ok(self.qtable.borrow_mut().alloc(queue))
+                Ok(self.runtime.alloc_queue::<CatcollarQueue>(queue))
             },
             _ => {
                 let errno: libc::c_int = unsafe { *libc::__errno_location() };
@@ -155,9 +147,12 @@ impl CatcollarLibOS {
     }
 
     /// Binds a socket to a local endpoint.
-    pub fn bind(&mut self, qd: QDesc, local: SocketAddrV4) -> Result<(), Fail> {
+    pub fn bind(&mut self, qd: QDesc, local: SocketAddr) -> Result<(), Fail> {
         trace!("bind() qd={:?}, local={:?}", qd, local);
-        let mut qtable: RefMut<IoQueueTable<CatcollarQueue>> = self.qtable.borrow_mut();
+
+        // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+        let local: SocketAddrV4 = unwrap_socketaddr(local)?;
+
         // Check if we are binding to the wildcard port.
         if local.port() == 0 {
             let cause: String = format!("cannot bind to port 0 (qd={:?})", qd);
@@ -165,37 +160,21 @@ impl CatcollarLibOS {
             return Err(Fail::new(libc::ENOTSUP, &cause));
         }
 
-        // Check if queue descriptor is valid.
-        if qtable.get(&qd).is_none() {
-            let cause: String = format!("invalid queue descriptor {:?}", qd);
-            error!("bind(): {}", &cause);
-            return Err(Fail::new(libc::EBADF, &cause));
+        // Check whether the address is in use.
+        if self.runtime.addr_in_use(local) {
+            let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
+            error!("bind(): {}", cause);
+            return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
-
-        // Check wether the address is in use.
-        for (_, queue) in qtable.get_values() {
-            if let Some(addr) = queue.get_addr() {
-                if addr == local {
-                    let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
-                    error!("bind(): {}", &cause);
-                    return Err(Fail::new(libc::EADDRINUSE, &cause));
-                }
-            }
-        }
-
-        // Get a mutable reference to the queue table.
-        // It is safe to unwrap because we checked before that the queue descriptor is valid.
-        let queue: &mut CatcollarQueue = qtable.get_mut(&qd).expect("queue descriptor should be in queue table");
-
         // Get reference to the underlying file descriptor.
-        // It is safe to unwrap because when creating a queue we assigned it a valid file descritor.
-        let fd: RawFd = queue.get_fd().expect("queue should have a file descriptor");
+        let fd: RawFd = self.get_queue_fd(&qd)?;
 
         // Bind underlying socket.
         let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&local);
         match unsafe { libc::bind(fd, &saddr as *const SockAddr, mem::size_of::<SockAddrIn>() as Socklen) } {
             stats if stats == 0 => {
-                queue.set_addr(local);
+                // Expect is safe here because we already looked up the queue in get_queue_fd().
+                self.get_shared_queue(&qd).expect("queue should exist").set_addr(local);
                 Ok(())
             },
             _ => {
@@ -211,162 +190,238 @@ impl CatcollarLibOS {
         trace!("listen() qd={:?}, backlog={:?}", qd, backlog);
 
         // We just assert backlog here, because it was previously checked at PDPIX layer.
-        debug_assert!((backlog > 0) && (backlog <= libc::SOMAXCONN as usize));
+        debug_assert!((backlog > 0) && (backlog <= SOMAXCONN as usize));
 
         // Issue listen operation.
-        match self.qtable.borrow().get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    if unsafe { libc::listen(fd, backlog as i32) } != 0 {
-                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                        error!("failed to listen ({:?})", errno);
-                        return Err(Fail::new(errno, "operation failed"));
-                    }
-                    Ok(())
-                },
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
-            },
-            None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+        let fd: RawFd = self.get_queue_fd(&qd)?;
+        if unsafe { libc::listen(fd, backlog as i32) } != 0 {
+            let errno: libc::c_int = unsafe { *libc::__errno_location() };
+            error!("failed to listen ({:?})", errno);
+            return Err(Fail::new(errno, "operation failed"));
         }
+        Ok(())
     }
 
     /// Accepts connections on a socket.
     pub fn accept(&mut self, qd: QDesc) -> Result<QToken, Fail> {
         trace!("accept(): qd={:?}", qd);
-        let mut qtable: RefMut<IoQueueTable<CatcollarQueue>> = self.qtable.borrow_mut();
 
-        let fd: RawFd = match qtable.get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => fd,
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
-            },
-            None => return Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
-        };
+        let fd: RawFd = self.get_queue_fd(&qd)?;
 
         // Issue accept operation.
-        let new_qd: QDesc = qtable.alloc(CatcollarQueue::new(QType::TcpSocket));
-        let future: AcceptFuture = AcceptFuture::new(fd);
-        let qtable_ptr: Rc<RefCell<IoQueueTable<CatcollarQueue>>> = self.qtable.clone();
-        let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-            // Wait for the accept routine to complete.
-            let result: Result<(RawFd, SocketAddrV4), Fail> = future.await;
-            // Borrow the queue table to either update the queue metadata or free the queue on error.
-            let mut qtable_: RefMut<IoQueueTable<CatcollarQueue>> = qtable_ptr.borrow_mut();
-            match result {
-                Ok((new_fd, addr)) => {
-                    let queue: &mut CatcollarQueue = qtable_
-                        .get_mut(&new_qd)
-                        .expect("New qd should have been already allocated");
-                    queue.set_addr(addr);
-                    queue.set_fd(new_fd);
-                    (qd, OperationResult::Accept((new_qd, addr)))
+        let yielder: Yielder = Yielder::new();
+        let coroutine: Pin<Box<Operation>> = Box::pin(Self::accept_coroutine(self.runtime.clone(), qd, fd, yielder));
+        let task_id: String = format!("Catcollar::accept for qd={:?}", qd);
+        Ok(self.runtime.insert_coroutine(&task_id, coroutine)?.get_task_id().into())
+    }
+
+    async fn accept_coroutine(
+        mut runtime: SharedDemiRuntime,
+        qd: QDesc,
+        fd: RawFd,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        // Borrow the queue table to either update the queue metadata or free the queue on error.
+        match Self::do_accept(fd, yielder).await {
+            Ok((new_fd, addr)) => {
+                let mut queue: CatcollarQueue = CatcollarQueue::new(QType::TcpSocket);
+                queue.set_addr(addr);
+                queue.set_fd(new_fd);
+                let new_qd: QDesc = runtime.alloc_queue::<CatcollarQueue>(queue);
+                (qd, OperationResult::Accept((new_qd, addr)))
+            },
+            Err(e) => (qd, OperationResult::Failed(e)),
+        }
+    }
+
+    async fn do_accept(fd: RawFd, yielder: Yielder) -> Result<(RawFd, SocketAddrV4), Fail> {
+        // Socket address of accept connection.
+        let mut saddr: SockAddr = unsafe { mem::zeroed() };
+        let mut address_len: Socklen = mem::size_of::<SockAddrIn>() as u32;
+
+        loop {
+            match unsafe { libc::accept(fd, &mut saddr as *mut SockAddr, &mut address_len) } {
+                // Operation completed.
+                new_fd if new_fd >= 0 => {
+                    trace!("connection accepted ({:?})", new_fd);
+
+                    // Set socket options.
+                    unsafe {
+                        if linux::set_tcp_nodelay(new_fd) != 0 {
+                            let errno: libc::c_int = *libc::__errno_location();
+                            warn!("cannot set TCP_NONDELAY option (errno={:?})", errno);
+                        }
+                        if linux::set_nonblock(new_fd) != 0 {
+                            let errno: libc::c_int = *libc::__errno_location();
+                            warn!("cannot set O_NONBLOCK option (errno={:?})", errno);
+                        }
+                        if linux::set_so_reuseport(new_fd) != 0 {
+                            let errno: libc::c_int = *libc::__errno_location();
+                            warn!("cannot set SO_REUSEPORT option (errno={:?})", errno);
+                        }
+                    }
+
+                    let addr: SocketAddrV4 = linux::sockaddr_to_socketaddrv4(&saddr);
+                    break Ok((new_fd, addr));
                 },
-                Err(e) => {
-                    qtable_.free(&new_qd);
-                    (qd, OperationResult::Failed(e))
+
+                // Operation not completed, thus parse errno to find out what happened.
+                _ => {
+                    let errno: libc::c_int = unsafe { *libc::__errno_location() };
+
+                    // Operation in progress.
+                    if DemiRuntime::should_retry(errno) {
+                        if let Err(e) = yielder.yield_once().await {
+                            let message: String = format!("accept(): operation canceled (err={:?})", e);
+                            error!("{}", message);
+                            break Err(Fail::new(libc::ECANCELED, &message));
+                        }
+                    } else {
+                        // Operation failed.
+                        let message: String = format!("accept(): operation failed (errno={:?})", errno);
+                        error!("{}", message);
+                        break Err(Fail::new(errno, &message));
+                    }
                 },
             }
-        });
-        let task_id: String = format!("Catcollar::accept for qd={:?}", qd);
-        let task: OperationTask = OperationTask::new(task_id, coroutine);
-        let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-            Some(handle) => handle,
-            None => {
-                qtable.free(&new_qd);
-                return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine"));
-            },
-        };
-        Ok(handle.get_task_id().into())
+        }
     }
 
     /// Establishes a connection to a remote endpoint.
-    pub fn connect(&mut self, qd: QDesc, remote: SocketAddrV4) -> Result<QToken, Fail> {
+    pub fn connect(&mut self, qd: QDesc, remote: SocketAddr) -> Result<QToken, Fail> {
         trace!("connect() qd={:?}, remote={:?}", qd, remote);
 
         // Issue connect operation.
-        match self.qtable.borrow().get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    let future: ConnectFuture = ConnectFuture::new(fd, remote);
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        // Wait for connect to finish.
-                        let result: Result<(), Fail> = future.await;
-                        // Handle the result.
-                        match result {
-                            Ok(()) => (qd, OperationResult::Connect),
-                            Err(e) => (qd, OperationResult::Failed(e)),
-                        }
-                    });
-                    let task_id: String = format!("Catcollar::connect for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, coroutine);
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-                    Ok(handle.get_task_id().into())
+        // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+        let remote: SocketAddrV4 = unwrap_socketaddr(remote)?;
+        let fd: RawFd = self.get_queue_fd(&qd)?;
+        let yielder: Yielder = Yielder::new();
+        let coroutine: Pin<Box<Operation>> = Box::pin(Self::connect_coroutine(qd, fd, remote, yielder));
+        let task_id: String = format!("Catcollar::connect for qd={:?}", qd);
+        Ok(self.runtime.insert_coroutine(&task_id, coroutine)?.get_task_id().into())
+    }
+
+    async fn connect_coroutine(
+        qd: QDesc,
+        fd: RawFd,
+        remote: SocketAddrV4,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        // Handle the result.
+        match Self::do_connect(fd, remote, yielder).await {
+            Ok(()) => (qd, OperationResult::Connect),
+            Err(e) => (qd, OperationResult::Failed(e)),
+        }
+    }
+
+    async fn do_connect(fd: RawFd, remote: SocketAddrV4, yielder: Yielder) -> Result<(), Fail> {
+        let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&remote);
+        loop {
+            match unsafe { libc::connect(fd, &saddr as *const SockAddr, mem::size_of::<SockAddrIn>() as Socklen) } {
+                // Operation completed.
+                stats if stats == 0 => {
+                    trace!("connection established (fd={:?})", fd);
+                    return Ok(());
                 },
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
-            },
-            _ => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+                // Operation not completed, thus parse errno to find out what happened.
+                _ => {
+                    let errno: libc::c_int = unsafe { *libc::__errno_location() };
+
+                    // Operation in progress.
+                    if DemiRuntime::should_retry(errno) {
+                        if let Err(e) = yielder.yield_once().await {
+                            let message: String = format!("connect(): operation canceled (err={:?})", e);
+                            error!("{}", message);
+                            return Err(Fail::new(libc::ECANCELED, &message));
+                        }
+                    } else {
+                        // Operation failed.
+                        let message: String = format!("connect(): operation failed (errno={:?})", errno);
+                        error!("{}", message);
+                        return Err(Fail::new(errno, &message));
+                    }
+                },
+            }
         }
     }
 
     /// Closes a socket.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
         trace!("close() qd={:?}", qd);
-        let mut qtable: RefMut<IoQueueTable<CatcollarQueue>> = self.qtable.borrow_mut();
-        match qtable.get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => match unsafe { libc::close(fd) } {
-                    stats if stats == 0 => (),
-                    _ => {
-                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
-                        error!("failed to close socket (fd={:?}, errno={:?})", fd, errno);
-                        return Err(Fail::new(errno, "operation failed"));
-                    },
-                },
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
+        let fd: RawFd = self.get_queue_fd(&qd)?;
+        match unsafe { libc::close(fd) } {
+            stats if stats == 0 => {
+                // Expect is safe here because we looked up the queue to schedule this coroutine and no other close
+                // coroutine should be able to run due to state machine checks.
+                self.runtime
+                    .free_queue::<CatcollarQueue>(&qd)
+                    .expect("queue should exist");
+                Ok(())
             },
-            None => return Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
-        };
-        qtable.free(&qd);
-        Ok(())
+            _ => {
+                let errno: libc::c_int = unsafe { *libc::__errno_location() };
+                error!("failed to close socket (fd={:?}, errno={:?})", fd, errno);
+                Err(Fail::new(errno, "operation failed"))
+            },
+        }
     }
 
     /// Asynchronous close
     pub fn async_close(&mut self, qd: QDesc) -> Result<QToken, Fail> {
         trace!("close() qd={:?}", qd);
+        let fd: RawFd = self.get_queue_fd(&qd)?;
+        let yielder: Yielder = Yielder::new();
+        let coroutine: Pin<Box<Operation>> = Box::pin(Self::close_coroutine(self.runtime.clone(), qd, fd, yielder));
+        let task_id: String = format!("Catcollar::close for qd={:?}", qd);
+        Ok(self.runtime.insert_coroutine(&task_id, coroutine)?.get_task_id().into())
+    }
 
-        match self.qtable.borrow().get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    let future: CloseFuture = CloseFuture::new(fd);
-                    let qtable_ptr: Rc<RefCell<IoQueueTable<CatcollarQueue>>> = self.qtable.clone();
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        // Wait for close to complete.
-                        let result: Result<(), Fail> = future.await;
-                        // Handle the result: Borrow the qtable and free the queue metadata and queue descriptor if the
-                        // close was successful.
-                        match result {
-                            Ok(()) => {
-                                let mut qtable_ = qtable_ptr.borrow_mut();
-                                qtable_.free(&qd);
-                                (qd, OperationResult::Close)
-                            },
-                            Err(e) => (qd, OperationResult::Failed(e)),
-                        }
-                    });
-                    let task_id: String = format!("Catcollar::close for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, coroutine);
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-                    Ok(handle.get_task_id().into())
-                },
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
+    async fn close_coroutine(
+        mut runtime: SharedDemiRuntime,
+        qd: QDesc,
+        fd: RawFd,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        // Handle the result: Borrow the qtable and free the queue metadata and queue descriptor if the
+        // close was successful.
+        match Self::do_close(fd, yielder).await {
+            Ok(()) => {
+                // Expect is safe here because we looked up the queue to schedule this coroutine and no other close
+                // coroutine should be able to run due to state machine checks.
+                runtime.free_queue::<CatcollarQueue>(&qd).expect("queue shouild exist");
+                (qd, OperationResult::Close)
             },
-            None => return Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+            Err(e) => (qd, OperationResult::Failed(e)),
+        }
+    }
+
+    async fn do_close(fd: RawFd, yielder: Yielder) -> Result<(), Fail> {
+        loop {
+            match unsafe { libc::close(fd) } {
+                // Operation completed.
+                stats if stats == 0 => {
+                    trace!("socket closed fd={:?}", fd);
+                    return Ok(());
+                },
+                // Operation not completed, thus parse errno to find out what happened.
+                _ => {
+                    let errno: libc::c_int = unsafe { *libc::__errno_location() };
+
+                    // Operation was interrupted, retry?
+                    if DemiRuntime::should_retry(errno) {
+                        if let Err(e) = yielder.yield_once().await {
+                            let message: String = format!("close(): operation canceled (err={:?})", e);
+                            error!("{}", message);
+                            return Err(Fail::new(libc::ECANCELED, &message));
+                        }
+                    } else {
+                        // Operation failed.
+                        let message: String = format!("close(): operation failed (errno={:?})", errno);
+                        error!("{}", message);
+                        return Err(Fail::new(errno, &message));
+                    }
+                },
+            }
         }
     }
 
@@ -381,73 +436,150 @@ impl CatcollarLibOS {
         }
 
         // Issue push operation.
-        match self.qtable.borrow().get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    // Issue operation.
-                    let future: PushFuture = PushFuture::new(self.runtime.clone(), fd, buf);
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        // Wait for the push to complete
-                        let result: Result<(), Fail> = future.await;
-                        // Handle the result.
-                        match result {
-                            Ok(()) => (qd, OperationResult::Push),
-                            Err(e) => (qd, OperationResult::Failed(e)),
-                        }
-                    });
-                    let task_id: String = format!("Catcollar::push for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, coroutine);
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-                    Ok(handle.get_task_id().into())
+        let fd: RawFd = self.get_queue_fd(&qd)?;
+        // Issue operation.
+        let yielder: Yielder = Yielder::new();
+        let coroutine: Pin<Box<Operation>> =
+            Box::pin(Self::push_coroutine(self.transport.clone(), qd, fd, buf, yielder));
+        let task_id: String = format!("Catcollar::push for qd={:?}", qd);
+        Ok(self.runtime.insert_coroutine(&task_id, coroutine)?.get_task_id().into())
+    }
+
+    async fn push_coroutine(
+        rt: SharedIoUringRuntime,
+        qd: QDesc,
+        fd: RawFd,
+        buf: DemiBuffer,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        match Self::do_push(rt, fd, buf, yielder).await {
+            Ok(()) => (qd, OperationResult::Push),
+            Err(e) => (qd, OperationResult::Failed(e)),
+        }
+    }
+
+    async fn do_push(mut rt: SharedIoUringRuntime, fd: RawFd, buf: DemiBuffer, yielder: Yielder) -> Result<(), Fail> {
+        let request_id: RequestId = rt.push(fd, buf.clone())?;
+        loop {
+            match rt.peek(request_id) {
+                // Operation completed.
+                Ok((_, size)) if size >= 0 => {
+                    trace!("data pushed ({:?} bytes)", size);
+                    return Ok(());
                 },
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
-            },
-            None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+                // Operation not completed, thus parse errno to find out what happened.
+                Ok((None, size)) if size < 0 => {
+                    let errno: i32 = -size;
+                    // Operation in progress.
+                    if DemiRuntime::should_retry(errno) {
+                        if let Err(e) = yielder.yield_once().await {
+                            let message: String = format!("push(): operation canceled (err={:?})", e);
+                            error!("{}", message);
+                            return Err(Fail::new(libc::ECANCELED, &message));
+                        }
+                    } else {
+                        let message: String = format!("push(): operation failed (errno={:?})", errno);
+                        error!("{}", message);
+                        return Err(Fail::new(errno, &message));
+                    }
+                },
+                // Operation failed.
+                Err(e) => {
+                    let message: String = format!("push(): operation failed (err={:?})", e);
+                    error!("{}", message);
+                    return Err(e);
+                },
+                // Should not happen.
+                _ => panic!("push failed: unknown error"),
+            }
         }
     }
 
     /// Pushes a scatter-gather array to a socket.
-    pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, remote: SocketAddrV4) -> Result<QToken, Fail> {
+    pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, remote: SocketAddr) -> Result<QToken, Fail> {
         trace!("pushto() qd={:?}", qd);
+
+        // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+        let remote: SocketAddrV4 = unwrap_socketaddr(remote)?;
 
         match self.runtime.clone_sgarray(sga) {
             Ok(buf) => {
                 if buf.len() == 0 {
                     return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
                 }
-
-                // Issue pushto operation.
-                match self.qtable.borrow().get(&qd) {
-                    Some(queue) => match queue.get_fd() {
-                        Some(fd) => {
-                            // Issue operation.
-                            let future: PushtoFuture = PushtoFuture::new(self.runtime.clone(), fd, remote, buf);
-                            let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                                // Wait for pushto to complete.
-                                let result: Result<(), Fail> = future.await;
-                                // Handle result.
-                                match result {
-                                    Ok(()) => (qd, OperationResult::Push),
-                                    Err(e) => (qd, OperationResult::Failed(e)),
-                                }
-                            });
-                            let task_id: String = format!("Catcollar::pushto for qd={:?}", qd);
-                            let task: OperationTask = OperationTask::new(task_id, coroutine);
-                            let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                                Some(handle) => handle,
-                                None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                            };
-                            Ok(handle.get_task_id().into())
-                        },
-                        None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
-                    },
-                    None => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
-                }
+                // Issue push operation.
+                let fd: RawFd = self.get_queue_fd(&qd)?;
+                // Issue operation.
+                let yielder: Yielder = Yielder::new();
+                let coroutine: Pin<Box<Operation>> = Box::pin(Self::pushto_coroutine(
+                    self.transport.clone(),
+                    qd,
+                    fd,
+                    remote,
+                    buf,
+                    yielder,
+                ));
+                let task_id: String = format!("Catcollar::pushto for qd={:?}", qd);
+                Ok(self.runtime.insert_coroutine(&task_id, coroutine)?.get_task_id().into())
             },
             Err(e) => Err(e),
+        }
+    }
+
+    async fn pushto_coroutine(
+        rt: SharedIoUringRuntime,
+        qd: QDesc,
+        fd: RawFd,
+        remote: SocketAddrV4,
+        buf: DemiBuffer,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        match Self::do_pushto(rt, fd, remote, buf, yielder).await {
+            Ok(()) => (qd, OperationResult::Push),
+            Err(e) => (qd, OperationResult::Failed(e)),
+        }
+    }
+
+    async fn do_pushto(
+        mut rt: SharedIoUringRuntime,
+        fd: RawFd,
+        remote: SocketAddrV4,
+        buf: DemiBuffer,
+        yielder: Yielder,
+    ) -> Result<(), Fail> {
+        let request_id: RequestId = rt.pushto(fd, remote, buf.clone())?;
+        loop {
+            match rt.peek(request_id) {
+                // Operation completed.
+                Ok((_, size)) if size >= 0 => {
+                    trace!("data pushed ({:?} bytes)", size);
+                    return Ok(());
+                },
+                // Operation not completed, thus parse errno to find out what happened.
+                Ok((None, size)) if size < 0 => {
+                    let errno: i32 = -size;
+                    // Operation in progress.
+                    if DemiRuntime::should_retry(errno) {
+                        if let Err(e) = yielder.yield_once().await {
+                            let message: String = format!("pushto(): operation canceled (err={:?})", e);
+                            error!("{}", message);
+                            return Err(Fail::new(libc::ECANCELED, &message));
+                        }
+                    } else {
+                        let message: String = format!("push(): operation failed (errno={:?})", errno);
+                        error!("{}", message);
+                        return Err(Fail::new(errno, &message));
+                    }
+                },
+                // Operation failed.
+                Err(e) => {
+                    let message: String = format!("push(): operation failed (err={:?})", e);
+                    error!("{}", message);
+                    return Err(e);
+                },
+                // Should not happen.
+                _ => panic!("push failed: unknown error"),
+            }
         }
     }
 
@@ -464,48 +596,83 @@ impl CatcollarLibOS {
         };
 
         // Issue pop operation.
-        match self.qtable.borrow().get(&qd) {
-            Some(queue) => match queue.get_fd() {
-                Some(fd) => {
-                    let future: PopFuture = PopFuture::new(self.runtime.clone(), fd, buf);
-                    let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                        // Wait for pop to complete.
-                        let result: Result<(Option<SocketAddrV4>, DemiBuffer), Fail> = future.await;
-                        // Handle the result: if successful, return the addr and buffer.
-                        match result {
-                            Ok((addr, buf)) => (qd, OperationResult::Pop(addr, buf)),
-                            Err(e) => (qd, OperationResult::Failed(e)),
-                        }
-                    });
-                    let task_id: String = format!("Catcollar::pop for qd={:?}", qd);
-                    let task: OperationTask = OperationTask::new(task_id, coroutine);
-                    let handle: TaskHandle = match self.runtime.scheduler.insert(task) {
-                        Some(handle) => handle,
-                        None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-                    };
-                    let qt: QToken = handle.get_task_id().into();
-                    Ok(qt)
-                },
-                None => unreachable!("CatcollarQueue has invalid underlying file descriptor"),
-            },
-            _ => Err(Fail::new(libc::EBADF, "invalid queue descriptor")),
+        // Issue push operation.
+        let fd: RawFd = self.get_queue_fd(&qd)?;
+        let yielder: Yielder = Yielder::new();
+        let coroutine: Pin<Box<Operation>> =
+            Box::pin(Self::pop_coroutine(self.transport.clone(), qd, fd, buf, yielder));
+        let task_id: String = format!("Catcollar::pop for qd={:?}", qd);
+        Ok(self.runtime.insert_coroutine(&task_id, coroutine)?.get_task_id().into())
+    }
+
+    async fn pop_coroutine(
+        rt: SharedIoUringRuntime,
+        qd: QDesc,
+        fd: RawFd,
+        buf: DemiBuffer,
+        yielder: Yielder,
+    ) -> (QDesc, OperationResult) {
+        // Handle the result: if successful, return the addr and buffer.
+        match Self::do_pop(rt, fd, buf, yielder).await {
+            Ok((addr, buf)) => (qd, OperationResult::Pop(addr, buf)),
+            Err(e) => (qd, OperationResult::Failed(e)),
         }
     }
 
-    pub fn poll(&self) {
-        self.runtime.scheduler.poll()
+    async fn do_pop(
+        mut rt: SharedIoUringRuntime,
+        fd: RawFd,
+        buf: DemiBuffer,
+        yielder: Yielder,
+    ) -> Result<(Option<SocketAddrV4>, DemiBuffer), Fail> {
+        let request_id: RequestId = rt.pop(fd, buf.clone())?;
+        loop {
+            match rt.peek(request_id) {
+                // Operation completed.
+                Ok((addr, size)) if size >= 0 => {
+                    trace!("data received ({:?} bytes)", size);
+                    let trim_size: usize = buf.len() - (size as usize);
+                    let mut buf: DemiBuffer = buf.clone();
+                    buf.trim(trim_size)?;
+                    break Ok((addr, buf));
+                },
+                // Operation not completed, thus parse errno to find out what happened.
+                Ok((None, size)) if size < 0 => {
+                    let errno: i32 = -size;
+                    if DemiRuntime::should_retry(errno) {
+                        if let Err(e) = yielder.yield_once().await {
+                            let message: String = format!("pop(): operation canceled (err={:?})", e);
+                            error!("{}", message);
+                            break Err(Fail::new(libc::ECANCELED, &message));
+                        }
+                    } else {
+                        let message: String = format!("pop(): operation failed (errno={:?})", errno);
+                        error!("{}", message);
+                        break Err(Fail::new(errno, &message));
+                    }
+                },
+                // Operation failed.
+                Err(e) => {
+                    let message: String = format!("pop(): operation failed (err={:?})", e);
+                    error!("{}", message);
+                    break Err(e);
+                },
+                // Should not happen.
+                _ => panic!("pop failed: unknown error"),
+            }
+        }
+    }
+
+    pub fn poll(&mut self) {
+        self.runtime.poll()
     }
 
     pub fn schedule(&mut self, qt: QToken) -> Result<TaskHandle, Fail> {
-        match self.runtime.scheduler.from_task_id(qt.into()) {
-            Some(handle) => Ok(handle),
-            None => return Err(Fail::new(libc::EINVAL, "invalid queue token")),
-        }
+        self.runtime.from_task_id(qt.into())
     }
 
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
-        let (qd, r): (QDesc, OperationResult) = self.take_result(handle);
-        Ok(pack_result(&self.runtime, r, qd, qt.into()))
+        self.runtime.remove_coroutine_and_get_result(&handle, qt.into())
     }
 
     /// Allocates a scatter-gather array.
@@ -520,95 +687,18 @@ impl CatcollarLibOS {
         self.runtime.free_sgarray(sga)
     }
 
-    /// Takes out the operation result descriptor associated with the target scheduler handle.
-    fn take_result(&mut self, handle: TaskHandle) -> (QDesc, OperationResult) {
-        let task: OperationTask = if let Some(task) = self.runtime.scheduler.remove(&handle) {
-            OperationTask::from(task.as_any())
-        } else {
-            panic!("Removing task that does not exist (either was previously removed or never inserted)");
-        };
-
-        task.get_result().expect("The coroutine has not finished")
+    fn get_shared_queue(&self, qd: &QDesc) -> Result<CatcollarQueue, Fail> {
+        Ok(self.runtime.get_shared_queue::<CatcollarQueue>(qd)?.clone())
     }
-}
-//======================================================================================================================
-// Standalone Functions
-//======================================================================================================================
 
-/// Packs a [OperationResult] into a [demi_qresult_t].
-fn pack_result(rt: &IoUringRuntime, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
-    match result {
-        OperationResult::Connect => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Accept((new_qd, addr)) => {
-            let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&addr);
-            let qr_value: demi_qr_value_t = demi_qr_value_t {
-                ares: demi_accept_result_t {
-                    qd: new_qd.into(),
-                    addr: saddr,
-                },
-            };
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_ACCEPT,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: 0,
-                qr_value,
-            }
-        },
-        OperationResult::Push => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Pop(addr, bytes) => match rt.into_sgarray(bytes) {
-            Ok(mut sga) => {
-                if let Some(addr) = addr {
-                    sga.sga_addr = linux::socketaddrv4_to_sockaddr(&addr);
-                }
-                let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_POP,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: 0,
-                    qr_value,
-                }
+    fn get_queue_fd(&self, qd: &QDesc) -> Result<RawFd, Fail> {
+        match self.get_shared_queue(qd)?.get_fd() {
+            Some(fd) => Ok(fd),
+            None => {
+                let cause: String = format!("invalid queue descriptor (qd={:?})", qd);
+                error!("get_cause_fd(): {}", &cause);
+                Err(Fail::new(libc::EBADF, &cause))
             },
-            Err(e) => {
-                warn!("Operation Failed: {:?}", e);
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: e.errno as i64,
-                    qr_value: unsafe { mem::zeroed() },
-                }
-            },
-        },
-        OperationResult::Close => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Failed(e) => {
-            warn!("Operation Failed: {:?}", e);
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: e.errno as i64,
-                qr_value: unsafe { mem::zeroed() },
-            }
-        },
+        }
     }
 }

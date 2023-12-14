@@ -3,13 +3,16 @@
 
 use crate::{
     inetstack::protocols::tcp::established::ctrlblk::SharedControlBlock,
-    runtime::fail::Fail,
-};
-use ::futures::{
-    future::{
-        self,
-        Either,
+    runtime::{
+        fail::Fail,
+        scheduler::Yielder,
+        timer::SharedTimer,
+        watched::SharedWatchedValue,
     },
+};
+use ::futures::future::{
+    self,
+    Either,
     FutureExt,
 };
 use ::std::time::{
@@ -17,19 +20,27 @@ use ::std::time::{
     Instant,
 };
 
-pub async fn retransmitter<const N: usize>(cb: SharedControlBlock<N>) -> Result<!, Fail> {
+pub async fn retransmitter<const N: usize>(mut cb: SharedControlBlock<N>, yielder: Yielder) -> Result<!, Fail> {
     loop {
         // Pin future for timeout retransmission.
-        let (rtx_deadline, rtx_deadline_changed) = cb.watch_retransmit_deadline();
+        let mut rtx_deadline_watched: SharedWatchedValue<Option<Instant>> = cb.watch_retransmit_deadline();
+        let rtx_yielder: Yielder = Yielder::new();
+        let rtx_deadline: Option<Instant> = rtx_deadline_watched.get();
+        let rtx_deadline_changed = rtx_deadline_watched.watch(rtx_yielder).fuse();
         futures::pin_mut!(rtx_deadline_changed);
+        let clock_ref: SharedTimer = cb.get_timer();
         let rtx_future = match rtx_deadline {
-            Some(t) => Either::Left(cb.clock.wait_until(cb.clock.clone(), t).fuse()),
+            Some(t) => Either::Left(clock_ref.wait_until(t, &yielder).fuse()),
             None => Either::Right(future::pending()),
         };
         futures::pin_mut!(rtx_future);
 
         // Pin future for fast retransmission.
-        let (rtx_fast_retransmit, rtx_fast_retransmit_changed) = cb.congestion_control_watch_retransmit_now_flag();
+        let mut rtx_fast_retransmit_watched: SharedWatchedValue<bool> =
+            cb.congestion_control_watch_retransmit_now_flag();
+        let retransmit_yielder: Yielder = Yielder::new();
+        let rtx_fast_retransmit: bool = rtx_fast_retransmit_watched.get();
+        let rtx_fast_retransmit_changed = rtx_fast_retransmit_watched.watch(retransmit_yielder).fuse();
         if rtx_fast_retransmit {
             // Notify congestion control about fast retransmit.
             cb.congestion_control_on_fast_retransmit();
@@ -40,16 +51,22 @@ pub async fn retransmitter<const N: usize>(cb: SharedControlBlock<N>) -> Result<
         }
         futures::pin_mut!(rtx_fast_retransmit_changed);
 
+        // Since these futures all share a single waker bit, they are all woken whenever one of them triggers.
         futures::select_biased! {
             _ = rtx_deadline_changed => continue,
             _ = rtx_fast_retransmit_changed => continue,
             _ = rtx_future => {
-                trace!("Retransmission Timer Expired");
+                match cb.get_retransmit_deadline() {
+                    Some(timeout) if timeout > cb.get_now() => continue,
+                    None => continue,
+                    _ => {},
+                }
+
                 // Notify congestion control about RTO.
                 // TODO: Is this the best place for this?
                 // TODO: Why call into ControlBlock to get SND.UNA when congestion_control_on_rto() has access to it?
-                let (send_unacknowledged, _) = cb.get_send_unacked();
-                cb.congestion_control_on_rto(send_unacknowledged);
+                let send_unacknowledged = cb.get_send_unacked();
+                cb.congestion_control_on_rto(send_unacknowledged.get());
 
                 // RFC 6298 Section 5.4: Retransmit earliest unacknowledged segment.
                 cb.retransmit();
@@ -59,7 +76,7 @@ pub async fn retransmitter<const N: usize>(cb: SharedControlBlock<N>) -> Result<
 
                 // RFC 6298 Section 5.6: Restart the retransmission timer with the new RTO.
                 let rto: Duration = cb.rto();
-                let deadline: Instant = cb.clock.now() + rto;
+                let deadline: Instant = cb.get_now() + rto;
                 cb.set_retransmit_deadline(Some(deadline));
             },
         }

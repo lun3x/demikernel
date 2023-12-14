@@ -2,20 +2,16 @@
 // Licensed under the MIT license.
 
 mod config;
-mod interop;
 pub mod runtime;
 
 //==============================================================================
 // Imports
 //==============================================================================
 
-use self::{
-    interop::pack_result,
-    runtime::LinuxRuntime,
-};
+use self::runtime::LinuxRuntime;
 use crate::{
     demikernel::config::Config,
-    inetstack::InetStack,
+    inetstack::SharedInetStack,
     runtime::{
         fail::Fail,
         memory::MemoryRuntime,
@@ -23,21 +19,16 @@ use crate::{
             consts::RECEIVE_BATCH_SIZE,
             NetworkRuntime,
         },
-        timer::{
-            Timer,
-            TimerRc,
-        },
+        scheduler::TaskHandle,
         types::{
             demi_qresult_t,
             demi_sgarray_t,
         },
-        OperationResult,
         QDesc,
         QToken,
         SharedBox,
         SharedDemiRuntime,
     },
-    scheduler::TaskHandle,
 };
 use ::std::{
     collections::HashMap,
@@ -46,8 +37,6 @@ use ::std::{
         Deref,
         DerefMut,
     },
-    rc::Rc,
-    time::Instant,
 };
 
 #[cfg(feature = "profiler")]
@@ -60,7 +49,7 @@ use crate::timer;
 /// Catpowder LibOS
 pub struct CatpowderLibOS {
     runtime: SharedDemiRuntime,
-    inetstack: InetStack<RECEIVE_BATCH_SIZE>,
+    inetstack: SharedInetStack<RECEIVE_BATCH_SIZE>,
     transport: LinuxRuntime,
 }
 
@@ -78,13 +67,10 @@ impl CatpowderLibOS {
             &config.local_interface_name(),
             HashMap::default(),
         );
-        let now: Instant = Instant::now();
-        let clock: TimerRc = TimerRc(Rc::new(Timer::new(now)));
         let rng_seed: [u8; 32] = [0; 32];
-        let inetstack: InetStack<RECEIVE_BATCH_SIZE> = InetStack::new(
+        let inetstack: SharedInetStack<RECEIVE_BATCH_SIZE> = SharedInetStack::new(
             runtime.clone(),
             SharedBox::<dyn NetworkRuntime<RECEIVE_BATCH_SIZE>>::new(Box::new(transport.clone())),
-            clock,
             transport.get_link_addr(),
             transport.get_ip_addr(),
             transport.get_udp_config(),
@@ -104,26 +90,20 @@ impl CatpowderLibOS {
     /// IO connection represented by `qd`. This operation returns immediately with a `QToken`.
     /// The data has been written when [`wait`ing](Self::wait) on the QToken returns.
     pub fn push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnip::push");
         trace!("push(): qd={:?}", qd);
         match self.transport.clone_sgarray(sga) {
             Ok(buf) => {
                 if buf.len() == 0 {
                     return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
                 }
-                let handle: TaskHandle = self.do_push(qd, buf)?;
-                let qt: QToken = handle.get_task_id().into();
-                Ok(qt)
+                self.do_push(qd, buf)
             },
             Err(e) => Err(e),
         }
     }
 
     pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, to: SocketAddr) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnip::pushto");
-        trace!("pushto2(): qd={:?}", qd);
+        trace!("pushto(): qd={:?}", qd);
         match self.transport.clone_sgarray(sga) {
             Ok(buf) => {
                 if buf.len() == 0 {
@@ -142,8 +122,7 @@ impl CatpowderLibOS {
     }
 
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
-        let (qd, r): (QDesc, OperationResult) = self.take_operation(handle);
-        Ok(pack_result(&self.transport, r, qd, qt.into()))
+        self.runtime.remove_coroutine_and_get_result(&handle, qt.into())
     }
 
     /// Allocates a scatter-gather array.
@@ -163,7 +142,7 @@ impl CatpowderLibOS {
 
 /// De-Reference Trait Implementation for Catpowder LibOS
 impl Deref for CatpowderLibOS {
-    type Target = InetStack<RECEIVE_BATCH_SIZE>;
+    type Target = SharedInetStack<RECEIVE_BATCH_SIZE>;
 
     fn deref(&self) -> &Self::Target {
         &self.inetstack

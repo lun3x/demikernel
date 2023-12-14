@@ -10,12 +10,9 @@ use super::{
     },
 };
 use crate::{
-    inetstack::{
-        futures::UtilityMethods,
-        protocols::ethernet2::{
-            EtherType2,
-            Ethernet2Header,
-        },
+    inetstack::protocols::ethernet2::{
+        EtherType2,
+        Ethernet2Header,
     },
     runtime::{
         fail::Fail,
@@ -25,7 +22,8 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        timer::TimerRc,
+        scheduler::Yielder,
+        timer::UtilityMethods,
         SharedBox,
         SharedDemiRuntime,
         SharedObject,
@@ -57,6 +55,10 @@ use ::std::{
 };
 
 //==============================================================================
+// Constants
+//==============================================================================
+
+//==============================================================================
 // Structures
 //==============================================================================
 
@@ -64,8 +66,8 @@ use ::std::{
 /// Arp Peer
 ///
 pub struct ArpPeer<const N: usize> {
+    runtime: SharedDemiRuntime,
     transport: SharedBox<dyn NetworkRuntime<N>>,
-    clock: TimerRc,
     local_link_addr: MacAddress,
     local_ipv4_addr: Ipv4Addr,
     cache: ArpCache,
@@ -82,22 +84,22 @@ pub struct SharedArpPeer<const N: usize>(SharedObject<ArpPeer<N>>);
 
 impl<const N: usize> ArpPeer<N> {
     pub fn new(
+        runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
-        clock: TimerRc,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
         arp_config: ArpConfig,
     ) -> Result<ArpPeer<N>, Fail> {
         let cache: ArpCache = ArpCache::new(
-            clock.clone(),
+            runtime.get_timer(),
             Some(arp_config.get_cache_ttl()),
             Some(arp_config.get_initial_values()),
             arp_config.get_disable_arp(),
         );
 
         Ok(Self {
+            runtime,
             transport,
-            clock,
             local_link_addr,
             local_ipv4_addr,
             cache,
@@ -108,17 +110,19 @@ impl<const N: usize> ArpPeer<N> {
 }
 
 impl<const N: usize> SharedArpPeer<N> {
+    /// ARP Cleanup timeout.
+    const ARP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
     pub fn new(
         mut runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
-        clock: TimerRc,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
         arp_config: ArpConfig,
     ) -> Result<Self, Fail> {
         let peer: SharedArpPeer<N> = Self(SharedObject::<ArpPeer<N>>::new(ArpPeer::<N>::new(
+            runtime.clone(),
             transport,
-            clock,
             local_link_addr,
             local_ipv4_addr,
             arp_config,
@@ -165,14 +169,12 @@ impl<const N: usize> SharedArpPeer<N> {
 
     /// Background task that cleans up the ARP cache from time to time.
     async fn background(&mut self) {
+        let yielder: Yielder = Yielder::new();
         loop {
-            let current_time = self.clock.now();
-            {
-                self.cache.advance_clock(current_time);
-                // TODO: re-enable eviction once TCP/IP stack is fully functional.
-                // cache.clear();
+            match self.runtime.get_timer().wait(Self::ARP_CLEANUP_TIMEOUT, &yielder).await {
+                Ok(()) => continue,
+                Err(_) => break,
             }
-            self.clock.wait(self.clock.clone(), Duration::from_secs(1)).await;
         }
     }
 
@@ -253,7 +255,7 @@ impl<const N: usize> SharedArpPeer<N> {
         self.cache.get(ipv4_addr).cloned()
     }
 
-    pub async fn query(&mut self, ipv4_addr: Ipv4Addr) -> Result<MacAddress, Fail> {
+    pub async fn query(&mut self, ipv4_addr: Ipv4Addr, yielder: &Yielder) -> Result<MacAddress, Fail> {
         if let Some(&link_addr) = self.cache.get(ipv4_addr) {
             return Ok(link_addr);
         }
@@ -277,12 +279,13 @@ impl<const N: usize> SharedArpPeer<N> {
             for i in 0..self.arp_config.get_retry_count() + 1 {
                 self.transport.transmit(Box::new(msg.clone()));
                 let timer = self
-                    .clock
-                    .wait(self.clock.clone(), self.arp_config.get_request_timeout());
+                    .runtime
+                    .get_timer()
+                    .wait(self.arp_config.get_request_timeout(), yielder);
 
                 match arp_response.with_timeout(timer).await {
                     Ok(link_addr) => {
-                        debug!("ARP result available ({})", link_addr);
+                        debug!("ARP result available ({:?})", link_addr);
                         return Ok(link_addr);
                     },
                     Err(_) => {

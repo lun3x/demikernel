@@ -19,6 +19,10 @@ use crate::{
             QDesc,
             QToken,
         },
+        scheduler::{
+            TaskHandle,
+            Yielder,
+        },
         types::{
             demi_opcode_t,
             demi_qresult_t,
@@ -26,16 +30,13 @@ use crate::{
         },
         OperationResult,
     },
-    scheduler::{
-        TaskHandle,
-        Yielder,
-    },
 };
 use ::rand::{
     rngs::SmallRng,
     RngCore,
     SeedableRng,
 };
+use ::socket2::Type;
 use ::std::{
     collections::HashSet,
     mem,
@@ -92,7 +93,7 @@ impl Socket {
     /// Creates a new socket that is not bound to an address.
     pub fn new(catmem: SharedCatmemLibOS) -> Result<Self, Fail> {
         Ok(Self {
-            state: SocketStateMachine::new_unbound(libc::SOCK_STREAM),
+            state: SocketStateMachine::new_unbound(Type::STREAM),
             catmem,
             catmem_qd: None,
             local: None,
@@ -114,7 +115,7 @@ impl Socket {
         remote: Option<SocketAddrV4>,
     ) -> Self {
         Self {
-            state: SocketStateMachine::new_connected(),
+            state: SocketStateMachine::new_established(),
             catmem,
             catmem_qd: Some(catmem_qd),
             local,
@@ -141,7 +142,7 @@ impl Socket {
                 Some(qd)
             },
             Err(e) => {
-                self.state.rollback();
+                self.state.abort();
                 return Err(e);
             },
         };
@@ -160,17 +161,16 @@ impl Socket {
         Ok(())
     }
 
-    pub fn accept<F>(&mut self, coroutine: F, yielder: Yielder) -> Result<TaskHandle, Fail>
+    pub fn accept<F>(&mut self, coroutine_constructor: F) -> Result<TaskHandle, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
-        self.state.prepare(SocketOp::Accept)?;
-        self.do_generic_sync_control_path_call(coroutine, yielder)
+        self.state.may_accept()?;
+        self.do_generic_sync_control_path_call(coroutine_constructor)
     }
 
     /// Attempts to accept a new connection on this socket. On success, returns a new Socket for the accepted connection.
     pub async fn do_accept(&mut self, ipv4: Ipv4Addr, new_port: u16, yielder: &Yielder) -> Result<Self, Fail> {
-        self.state.prepare(SocketOp::Accepted)?;
         let mut catmem: SharedCatmemLibOS = self.catmem.clone();
         let catmem_qd: QDesc = self.catmem_qd.expect("Must be a catmem queue in this state.");
         loop {
@@ -200,7 +200,6 @@ impl Socket {
                         match create_pipe(&mut catmem, catmem_qd, &ipv4, new_port, &yielder).await {
                             Ok(new_qd) => new_qd,
                             Err(e) => {
-                                self.state.rollback();
                                 return Err(e);
                             },
                         }
@@ -208,7 +207,6 @@ impl Socket {
                 },
                 // Some error.
                 Err(e) => {
-                    self.state.rollback();
                     return Err(e);
                 },
             };
@@ -228,7 +226,6 @@ impl Socket {
                 },
                 // Some error.
                 Err(e) => {
-                    self.state.rollback();
                     // Clean up newly allocated duplex pipe.
                     catmem.close(new_qd)?;
                     return Err(e);
@@ -237,17 +234,16 @@ impl Socket {
         }
     }
 
-    pub fn connect<F>(&mut self, coroutine: F, yielder: Yielder) -> Result<TaskHandle, Fail>
+    pub fn connect<F>(&mut self, coroutine_constructor: F) -> Result<TaskHandle, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         self.state.prepare(SocketOp::Connect)?;
-        self.do_generic_sync_control_path_call(coroutine, yielder)
+        self.do_generic_sync_control_path_call(coroutine_constructor)
     }
 
     /// Connects this socket to [remote].
     pub async fn do_connect(&mut self, remote: SocketAddrV4, yielder: &Yielder) -> Result<(), Fail> {
-        self.state.prepare(SocketOp::Connected)?;
         let ipv4: &Ipv4Addr = remote.ip();
         let port: u16 = remote.port().into();
         let mut catmem: SharedCatmemLibOS = self.catmem.clone();
@@ -259,7 +255,8 @@ impl Socket {
             let new_port: u16 = match get_port(&mut catmem, ipv4, port, &request_id, yielder).await {
                 Ok(new_port) => new_port,
                 Err(e) => {
-                    self.state.rollback();
+                    self.state.prepare(SocketOp::Closed)?;
+                    self.state.commit();
                     return Err(e);
                 },
             };
@@ -269,13 +266,15 @@ impl Socket {
             let new_qd: QDesc = match catmem.open_pipe(&format_pipe_str(ipv4, new_port)) {
                 Ok(new_qd) => new_qd,
                 Err(e) => {
-                    self.state.rollback();
+                    self.state.prepare(SocketOp::Closed)?;
+                    self.state.commit();
                     return Err(e);
                 },
             };
             // Send an ack to the server over the new pipe.
             if let Err(e) = send_ack(&mut catmem, new_qd, &request_id, &yielder).await {
-                self.state.rollback();
+                self.state.prepare(SocketOp::Closed)?;
+                self.state.commit();
                 return Err(e);
             }
             Ok((new_qd, remote))
@@ -283,13 +282,15 @@ impl Socket {
 
         match result {
             Ok((new_qd, remote)) => {
+                self.state.prepare(SocketOp::Established)?;
                 self.state.commit();
                 self.catmem_qd = Some(new_qd);
                 self.remote = Some(remote);
                 Ok(())
             },
             Err(e) => {
-                self.state.rollback();
+                self.state.prepare(SocketOp::Closed)?;
+                self.state.commit();
                 Err(e)
             },
         }
@@ -299,15 +300,14 @@ impl Socket {
     pub fn close(&mut self) -> Result<(), Fail> {
         self.state.prepare(SocketOp::Close)?;
         self.state.commit();
-        self.state.prepare(SocketOp::Closed)?;
         if let Some(qd) = self.catmem_qd {
             match self.catmem.close(qd) {
                 Ok(()) => {
+                    self.state.prepare(SocketOp::Closed)?;
                     self.state.commit();
                     return Ok(());
                 },
                 Err(e) => {
-                    self.state.rollback();
                     return Err(e);
                 },
             }
@@ -317,12 +317,12 @@ impl Socket {
     }
 
     /// Asynchronously closes this socket by allocating a coroutine.
-    pub fn async_close<F>(&mut self, coroutine: F, yielder: Yielder) -> Result<TaskHandle, Fail>
+    pub fn async_close<F>(&mut self, coroutine_constructor: F) -> Result<TaskHandle, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         self.state.prepare(SocketOp::Close)?;
-        Ok(self.do_generic_sync_control_path_call(coroutine, yielder)?)
+        Ok(self.do_generic_sync_control_path_call(coroutine_constructor)?)
     }
 
     /// Closes `socket`.
@@ -330,15 +330,14 @@ impl Socket {
         // TODO: Should we assert that we're still in the close state?
         let catmem_qd: Option<QDesc> = self.catmem_qd;
         if let Some(qd) = catmem_qd {
-            self.state.prepare(SocketOp::Closed)?;
             match self.catmem.clone().close_coroutine(qd, yielder).await {
                 (qd, OperationResult::Close) => {
+                    self.state.prepare(SocketOp::Closed)?;
                     self.state.commit();
                     Ok((qd, OperationResult::Close))
                 },
                 (qd, OperationResult::Failed(e)) => {
                     // Where to revert to?
-                    self.state.rollback();
                     Ok((qd, OperationResult::Failed(e)))
                 },
                 _ => panic!("Should not return anything other than close or fail"),
@@ -351,12 +350,12 @@ impl Socket {
 
     /// Schedule a coroutine to push to this queue. This function contains all of the single-queue,
     /// asynchronous code necessary to run push a buffer and any single-queue functionality after the push completes.
-    pub fn push<F: FnOnce(Yielder) -> Result<TaskHandle, Fail>>(
-        &self,
-        coroutine: F,
-        yielder: Yielder,
-    ) -> Result<TaskHandle, Fail> {
-        coroutine(yielder)
+    pub fn push<F>(&self, coroutine_constructor: F) -> Result<TaskHandle, Fail>
+    where
+        F: FnOnce() -> Result<TaskHandle, Fail>,
+    {
+        self.state.may_push()?;
+        coroutine_constructor()
     }
 
     /// Asynchronous code for pushing to the underlying Catmem transport.
@@ -371,12 +370,12 @@ impl Socket {
 
     /// Schedule a coroutine to pop from the underlying Catmem queue. This function contains all of the single-queue,
     /// asynchronous code necessary to run push a buffer and any single-queue functionality after the pop completes.
-    pub fn pop<F: FnOnce(Yielder) -> Result<TaskHandle, Fail>>(
-        &self,
-        coroutine: F,
-        yielder: Yielder,
-    ) -> Result<TaskHandle, Fail> {
-        coroutine(yielder)
+    pub fn pop<F>(&self, coroutine_constructor: F) -> Result<TaskHandle, Fail>
+    where
+        F: FnOnce() -> Result<TaskHandle, Fail>,
+    {
+        self.state.may_pop()?;
+        coroutine_constructor()
     }
 
     /// Asynchronous code for popping from the underlying Catmem transport.
@@ -403,17 +402,17 @@ impl Socket {
     }
 
     /// Generic function for spawning a control-path coroutine on [self].
-    fn do_generic_sync_control_path_call<F>(&mut self, coroutine: F, yielder: Yielder) -> Result<TaskHandle, Fail>
+    fn do_generic_sync_control_path_call<F>(&mut self, coroutine_constructor: F) -> Result<TaskHandle, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         // Spawn coroutine.
-        match coroutine(yielder) {
+        match coroutine_constructor() {
             // We successfully spawned the coroutine.
-            Ok(handle) => {
+            Ok(task_handle) => {
                 // Commit the operation on the socket.
                 self.state.commit();
-                Ok(handle)
+                Ok(task_handle)
             },
             // We failed to spawn the coroutine.
             Err(e) => {
@@ -475,7 +474,7 @@ async fn pop_request_id(
 
     // Parse and check request.
     let result: Result<RequestId, Fail> = get_connect_id(&sga);
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
     result
 }
 
@@ -493,7 +492,7 @@ async fn create_pipe(
     // to open the duplex pipe before it is created.
     let new_qd: QDesc = catmem.create_pipe(&format_pipe_str(ipv4, port))?;
     // Allocate a scatter-gather array and send the port number to the remote.
-    let sga: demi_sgarray_t = catmem.alloc_sgarray(mem::size_of_val(&port))?;
+    let sga: demi_sgarray_t = catmem.sgaalloc(mem::size_of_val(&port))?;
     let ptr: *mut u8 = sga.sga_segs[0].sgaseg_buf as *mut u8;
     let len: usize = sga.sga_segs[0].sgaseg_len as usize;
     let slice: &mut [u8] = unsafe { slice::from_raw_parts_mut(ptr, len) };
@@ -513,7 +512,7 @@ async fn create_pipe(
         }
     }
     // Free the scatter-gather array.
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
 
     // Retrieve operation result and check if it is what we expect.
     let qr: demi_qresult_t = catmem.pack_result(handle, qt)?;
@@ -562,7 +561,7 @@ async fn send_connection_request(
         }
     }
     // Free the message buffer.
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
     // Get the result of the push.
     let qr: demi_qresult_t = catmem.pack_result(handle, qt)?;
     match qr.qr_opcode {
@@ -643,7 +642,7 @@ async fn get_port(
 
                     // Extract port number.
                     let port: Result<u16, Fail> = extract_port_number(&sga);
-                    catmem.free_sgarray(sga)?;
+                    catmem.sgafree(sga)?;
                     return port;
                 },
                 // We may get some error.
@@ -693,7 +692,7 @@ async fn send_ack(
         }
     }
     // Free the message buffer.
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
     // Retrieve operation result and check if it is what we expect.
     let qr: demi_qresult_t = catmem.pack_result(handle, qt)?;
 
@@ -720,7 +719,7 @@ async fn send_ack(
 
 /// Creates a magic connect message.
 pub fn send_connect_id(catmem: &mut SharedCatmemLibOS, request_id: &RequestId) -> Result<demi_sgarray_t, Fail> {
-    let sga: demi_sgarray_t = catmem.alloc_sgarray(mem::size_of_val(&request_id))?;
+    let sga: demi_sgarray_t = catmem.sgaalloc(mem::size_of_val(&request_id))?;
     let ptr: *mut u64 = sga.sga_segs[0].sgaseg_buf as *mut u64;
     unsafe {
         *ptr = request_id.0;

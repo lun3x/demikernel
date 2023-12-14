@@ -7,7 +7,7 @@
 
 use super::runtime::SharedDummyRuntime;
 use ::demikernel::{
-    inetstack::InetStack,
+    inetstack::SharedInetStack,
     runtime::{
         fail::Fail,
         logging,
@@ -21,10 +21,6 @@ use ::demikernel::{
             types::MacAddress,
             NetworkRuntime,
         },
-        timer::{
-            Timer,
-            TimerRc,
-        },
         SharedBox,
         SharedDemiRuntime,
     },
@@ -37,11 +33,7 @@ use demikernel::runtime::network::consts::RECEIVE_BATCH_SIZE;
 use std::{
     collections::HashMap,
     net::Ipv4Addr,
-    rc::Rc,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Duration,
 };
 
 //==============================================================================
@@ -62,9 +54,8 @@ impl DummyLibOS {
         tx: Sender<DemiBuffer>,
         rx: Receiver<DemiBuffer>,
         arp: HashMap<Ipv4Addr, MacAddress>,
-    ) -> Result<InetStack<RECEIVE_BATCH_SIZE>, Fail> {
-        let now: Instant = Instant::now();
-        let runtime: SharedDemiRuntime = SharedDemiRuntime::new();
+    ) -> Result<SharedInetStack<RECEIVE_BATCH_SIZE>, Fail> {
+        let runtime: SharedDemiRuntime = SharedDemiRuntime::default();
         let transport: SharedDummyRuntime = SharedDummyRuntime::new(rx, tx);
         let arp_config: ArpConfig = ArpConfig::new(
             Some(Duration::from_secs(600)),
@@ -75,13 +66,11 @@ impl DummyLibOS {
         );
         let udp_config: UdpConfig = UdpConfig::default();
         let tcp_config: TcpConfig = TcpConfig::default();
-        let clock: TimerRc = TimerRc(Rc::new(Timer::new(now)));
         let rng_seed: [u8; 32] = [0; 32];
         logging::initialize();
-        InetStack::new(
+        SharedInetStack::new(
             runtime,
             SharedBox::<dyn NetworkRuntime<RECEIVE_BATCH_SIZE>>::new(Box::new(transport)),
-            clock,
             link_addr,
             ipv4_addr,
             udp_config,

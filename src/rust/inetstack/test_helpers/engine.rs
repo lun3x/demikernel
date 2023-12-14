@@ -9,12 +9,6 @@ use crate::{
                 EtherType2,
                 Ethernet2Header,
             },
-            tcp::operations::{
-                AcceptFuture,
-                ConnectFuture,
-                PopFuture,
-                PushFuture,
-            },
             udp::SharedUdpPeer,
             Peer,
         },
@@ -29,8 +23,10 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
+        scheduler::Yielder,
         Operation,
         QDesc,
+        QToken,
         SharedBox,
         SharedObject,
     },
@@ -76,7 +72,6 @@ impl<const N: usize> SharedEngine<N> {
         let arp = SharedArpPeer::new(
             test_rig.get_runtime(),
             boxed_test_rig.clone(),
-            test_rig.get_clock(),
             link_addr,
             ipv4_addr,
             arp_config,
@@ -85,7 +80,6 @@ impl<const N: usize> SharedEngine<N> {
         let ipv4 = Peer::new(
             test_rig.get_runtime(),
             boxed_test_rig.clone(),
-            test_rig.get_clock(),
             link_addr,
             ipv4_addr,
             udp_config,
@@ -97,7 +91,7 @@ impl<const N: usize> SharedEngine<N> {
     }
 
     pub fn advance_clock(&mut self, now: Instant) {
-        self.test_rig.get_clock().advance_clock(now)
+        self.test_rig.advance_clock(now)
     }
 
     pub fn receive(&mut self, bytes: DemiBuffer) -> Result<(), Fail> {
@@ -117,14 +111,14 @@ impl<const N: usize> SharedEngine<N> {
         self.ipv4.ping(dest_ipv4_addr, timeout).await
     }
 
-    pub fn udp_pushto(&self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<(), Fail> {
+    pub fn udp_pushto(&self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<Pin<Box<Operation>>, Fail> {
         let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
         udp.pushto(qd, buf, to)
     }
 
-    pub fn udp_pop(&self, qd: QDesc) -> Pin<Box<Operation>> {
+    pub fn udp_pop(&self, qd: QDesc) -> Result<Pin<Box<Operation>>, Fail> {
         let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
-        Box::pin(async move { udp.pop_coroutine(qd, None).await })
+        udp.pop(qd, None)
     }
 
     pub fn udp_socket(&mut self) -> Result<QDesc, Fail> {
@@ -143,29 +137,28 @@ impl<const N: usize> SharedEngine<N> {
         self.ipv4.tcp.socket()
     }
 
-    pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> ConnectFuture<N> {
-        self.ipv4.tcp.connect(socket_fd, remote_endpoint).unwrap()
+    pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> Result<QToken, Fail> {
+        self.ipv4.tcp.connect(socket_fd, remote_endpoint)
     }
 
     pub fn tcp_bind(&mut self, socket_fd: QDesc, endpoint: SocketAddrV4) -> Result<(), Fail> {
         self.ipv4.tcp.bind(socket_fd, endpoint)
     }
 
-    pub fn tcp_accept(&mut self, fd: QDesc) -> AcceptFuture<N> {
-        let (_, future) = self.ipv4.tcp.accept(fd);
-        future
+    pub fn tcp_accept(&mut self, fd: QDesc) -> Result<QToken, Fail> {
+        self.ipv4.tcp.accept(fd)
     }
 
-    pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> PushFuture {
+    pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
         self.ipv4.tcp.push(socket_fd, buf)
     }
 
-    pub fn tcp_pop(&mut self, socket_fd: QDesc) -> PopFuture<N> {
+    pub fn tcp_pop(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
         self.ipv4.tcp.pop(socket_fd, None)
     }
 
-    pub fn tcp_close(&mut self, socket_fd: QDesc) -> Result<(), Fail> {
-        self.ipv4.tcp.close(socket_fd)
+    pub fn tcp_async_close(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
+        self.ipv4.tcp.async_close(socket_fd)
     }
 
     pub fn tcp_listen(&mut self, socket_fd: QDesc, backlog: usize) -> Result<(), Fail> {
@@ -173,7 +166,7 @@ impl<const N: usize> SharedEngine<N> {
     }
 
     pub async fn arp_query(&mut self, ipv4_addr: Ipv4Addr) -> Result<MacAddress, Fail> {
-        self.arp.query(ipv4_addr).await
+        self.arp.query(ipv4_addr, &Yielder::new()).await
     }
 
     pub fn tcp_mss(&self, handle: QDesc) -> Result<usize, Fail> {

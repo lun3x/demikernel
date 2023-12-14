@@ -7,16 +7,11 @@
 
 use super::{
     datagram::UdpHeader,
-    queue::{
-        QueueSlot,
-        SharedQueue,
-        SharedUdpQueue,
-    },
+    queue::SharedUdpQueue,
 };
 use crate::{
     inetstack::protocols::{
         arp::SharedArpPeer,
-        ip::EphemeralPorts,
         ipv4::Ipv4Header,
     },
     runtime::{
@@ -28,21 +23,16 @@ use crate::{
         },
         queue::{
             downcast_queue_ptr,
+            NetworkQueue,
             OperationResult,
             QDesc,
         },
+        scheduler::Yielder,
+        Operation,
         SharedBox,
         SharedDemiRuntime,
         SharedObject,
     },
-    scheduler::{
-        TaskHandle,
-        Yielder,
-    },
-};
-use ::rand::{
-    prelude::SmallRng,
-    SeedableRng,
 };
 use ::std::{
     net::{
@@ -53,20 +43,11 @@ use ::std::{
         Deref,
         DerefMut,
     },
+    pin::Pin,
 };
 
 #[cfg(feature = "profiler")]
 use crate::timer;
-
-//======================================================================================================================
-// Constants
-//======================================================================================================================
-
-// Maximum size for receive queues (in messages).
-const RECV_QUEUE_MAX_SIZE: usize = 1024;
-
-// Maximum size for send queues (in messages).
-const SEND_QUEUE_MAX_SIZE: usize = 1024;
 
 //======================================================================================================================
 // Structures
@@ -81,21 +62,12 @@ pub struct UdpPeer<const N: usize> {
     transport: SharedBox<dyn NetworkRuntime<N>>,
     /// Underlying ARP peer.
     arp: SharedArpPeer<N>,
-    /// Ephemeral ports.
-    ephemeral_ports: EphemeralPorts,
-    /// Queue of unset datagrams. This is shared across fast/slow paths.
-    send_queue: SharedQueue<N>,
     /// Local link address.
     local_link_addr: MacAddress,
     /// Local IPv4 address.
     local_ipv4_addr: Ipv4Addr,
     /// Offload checksum to hardware?
     checksum_offload: bool,
-
-    /// The background co-routine sends unset UDP packets.
-    /// We annotate it as unused because the compiler believes that it is never called which is not the case.
-    #[allow(unused)]
-    background: TaskHandle,
 }
 
 #[derive(Clone)]
@@ -105,119 +77,44 @@ pub struct SharedUdpPeer<const N: usize>(SharedObject<UdpPeer<N>>);
 // Associate Functions
 //======================================================================================================================
 
-/// Associate functions for [UdpPeer].
-impl<const N: usize> UdpPeer<N> {
-    /// Creates a Udp peer.
-    pub fn new(
-        mut runtime: SharedDemiRuntime,
-        transport: SharedBox<dyn NetworkRuntime<N>>,
-        rng_seed: [u8; 32],
-        local_link_addr: MacAddress,
-        local_ipv4_addr: Ipv4Addr,
-        offload_checksum: bool,
-        arp: SharedArpPeer<N>,
-    ) -> Result<Self, Fail> {
-        let send_queue: SharedQueue<N> = SharedQueue::<N>::new(SEND_QUEUE_MAX_SIZE);
-        let mut rng: SmallRng = SmallRng::from_seed(rng_seed);
-        let ephemeral_ports: EphemeralPorts = EphemeralPorts::new(&mut rng);
-
-        let coroutine = Self::background_sender_coroutine(
-            local_ipv4_addr,
-            local_link_addr,
-            offload_checksum,
-            arp.clone(),
-            send_queue.clone(),
-        );
-        let handle: TaskHandle =
-            runtime.insert_background_coroutine("Inetstack::UDP::background", Box::pin(coroutine))?;
-        Ok(Self {
-            runtime,
-            transport,
-            arp,
-            ephemeral_ports,
-            send_queue,
-            local_link_addr,
-            local_ipv4_addr,
-            checksum_offload: offload_checksum,
-            background: handle,
-        })
-    }
-
-    /// Asynchronously send unsent datagrams to remote peer.
-    async fn background_sender_coroutine(
-        local_ipv4_addr: Ipv4Addr,
-        local_link_addr: MacAddress,
-        offload_checksum: bool,
-        mut arp: SharedArpPeer<N>,
-        mut rx: SharedQueue<N>,
-    ) {
-        loop {
-            // Grab next unsent datagram.
-            match rx.pop().await {
-                // Resolve remote address.
-                Ok(slot) => {
-                    match arp.query(slot.get_remote().ip().clone()).await {
-                        Ok(link_addr) => {
-                            if let Err(e) = slot.get_queue().pushto(
-                                local_ipv4_addr,
-                                &slot.get_remote(),
-                                local_link_addr,
-                                link_addr,
-                                slot.get_data(),
-                                offload_checksum,
-                            ) {
-                                let cause: String = format!("failed to send: {}", e);
-                                warn!("background_sender_coroutine(): {}", cause);
-                            }
-                        },
-                        // ARP query failed.
-                        Err(e) => warn!("Failed to send UDP datagram: {:?}", e),
-                    }
-                },
-                // Pop from shared queue failed.
-                Err(e) => warn!("Failed to send UDP datagram: {:?}", e),
-            }
-        }
-    }
-}
+/// Associate functions for [SharedUdpPeer].
 
 impl<const N: usize> SharedUdpPeer<N> {
     pub fn new(
         runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
-        rng_seed: [u8; 32],
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
         offload_checksum: bool,
         arp: SharedArpPeer<N>,
     ) -> Result<Self, Fail> {
-        Ok(Self(SharedObject::<UdpPeer<N>>::new(UdpPeer::<N>::new(
+        Ok(Self(SharedObject::<UdpPeer<N>>::new(UdpPeer {
             runtime,
             transport,
-            rng_seed,
+            arp,
             local_link_addr,
             local_ipv4_addr,
-            offload_checksum,
-            arp,
-        )?)))
+            checksum_offload: offload_checksum,
+        })))
     }
 
     /// Opens a UDP socket.
     pub fn socket(&mut self) -> Result<QDesc, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("udp::socket");
-        let transport: SharedBox<dyn NetworkRuntime<N>> = self.transport.clone();
-        let new_qd: QDesc = self.runtime.alloc_queue::<SharedUdpQueue<N>>(SharedUdpQueue::new(
-            transport,
-            SharedQueue::<N>::new(RECV_QUEUE_MAX_SIZE),
-        ));
+        let new_queue: SharedUdpQueue<N> = SharedUdpQueue::new(
+            self.local_ipv4_addr,
+            self.local_link_addr,
+            self.transport.clone(),
+            self.arp.clone(),
+            self.checksum_offload,
+        )?;
+        let new_qd: QDesc = self.runtime.alloc_queue::<SharedUdpQueue<N>>(new_queue);
+        trace!("socket(): qd={:?}", new_qd);
         Ok(new_qd)
     }
 
     /// Binds a UDP socket to a local endpoint address.
     pub fn bind(&mut self, qd: QDesc, mut addr: SocketAddrV4) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("udp::bind");
+        trace!("bind(): qd={:?}", qd);
         // Check whether queue is already bound.
         let mut queue: SharedUdpQueue<N> = self.get_shared_queue(&qd)?;
 
@@ -229,20 +126,20 @@ impl<const N: usize> SharedUdpPeer<N> {
 
         // Check whether address is in use.
         // TODO: Move to addr_in_use in runtime eventually.
-        if self.get_queue_from_addr(&addr).is_some() {
+        if self.runtime.addr_in_use(addr) {
             let cause: String = format!("address is already bound to socket");
             error!("bind(): {}", cause);
             return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
 
         // Check if this is an ephemeral port or a wildcard one.
-        if EphemeralPorts::is_private(addr.port()) {
+        if SharedDemiRuntime::is_private_ephemeral_port(addr.port()) {
             // Allocate ephemeral port from the pool, to leave  ephemeral port allocator in a consistent state.
-            self.ephemeral_ports.alloc_port(addr.port())?
+            self.runtime.reserve_ephemeral_port(addr.port())?
         } else if addr.port() == 0 {
             // Allocate ephemeral port.
             // TODO: we should free this when closing.
-            let new_port: u16 = self.ephemeral_ports.alloc_any()?;
+            let new_port: u16 = self.runtime.alloc_ephemeral_port()?;
             addr.set_port(new_port);
         }
 
@@ -252,57 +149,43 @@ impl<const N: usize> SharedUdpPeer<N> {
 
     /// Closes a UDP socket.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("udp::close");
-        let queue: SharedUdpQueue<N> = self.runtime.free_queue::<SharedUdpQueue<N>>(&qd)?;
+        trace!("close(): qd={:?}", qd);
+        let mut queue: SharedUdpQueue<N> = self.runtime.free_queue::<SharedUdpQueue<N>>(&qd)?;
         queue.close()?;
         Ok(())
     }
 
     /// Pushes data to a remote UDP peer.
-    pub fn pushto(&mut self, qd: QDesc, data: DemiBuffer, remote: SocketAddrV4) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("udp::pushto");
-        // Lookup associated endpoint.
+    pub fn pushto(&mut self, qd: QDesc, buf: DemiBuffer, remote: SocketAddrV4) -> Result<Pin<Box<Operation>>, Fail> {
+        trace!("pushto(): qd={:?} remote={:?} bytes={:?}", qd, remote, buf.len());
         let mut queue: SharedUdpQueue<N> = self.get_shared_queue(&qd)?;
-        // What happens if not bound?
-        // TODO: Move to a UDP socket state machine.
+        // TODO: Allocate ephemeral port if not bound.
+        // FIXME: https://github.com/microsoft/demikernel/issues/973
         if !queue.is_bound() {
-            let cause: String = format!("queue is not bound (qd={:?})", qd);
+            let cause: String = format!("queue is not bound");
             error!("pushto(): {}", &cause);
             return Err(Fail::new(libc::ENOTSUP, &cause));
         }
-        // Fast path: try to send the datagram immediately.
-        if let Some(remote_link_addr) = self.arp.try_query(remote.ip().clone()) {
-            queue.pushto(
-                self.local_ipv4_addr,
-                &remote,
-                self.local_link_addr,
-                remote_link_addr,
-                data,
-                self.checksum_offload,
-            )
-        } else {
-            // Slow path: Defer send operation to the async path.
-            self.send_queue.push(QueueSlot::<N>::new(queue.clone(), remote, data))
-        }
+        let yielder: Yielder = Yielder::new();
+        Ok(Box::pin(async move {
+            match queue.pushto(remote, buf, yielder).await {
+                Ok(()) => (qd, OperationResult::Push),
+                Err(e) => (qd, OperationResult::Failed(e)),
+            }
+        }))
     }
 
     /// Pops data from a socket.
-    pub async fn pop_coroutine(&mut self, qd: QDesc, size: Option<usize>) -> (QDesc, OperationResult) {
-        #[cfg(feature = "profiler")]
-        timer!("udp::pop");
-
-        // Make sure the queue still exists.
+    pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<Pin<Box<Operation>>, Fail> {
         let yielder: Yielder = Yielder::new();
-        let mut queue: SharedUdpQueue<N> = match self.get_shared_queue(&qd) {
-            Ok(queue) => queue,
-            Err(e) => return (qd, OperationResult::Failed(e)),
-        };
-        match queue.pop(size, yielder).await {
-            Ok((addr, buf)) => (qd, OperationResult::Pop(Some(addr), buf)),
-            Err(e) => (qd, OperationResult::Failed(e)),
-        }
+        let mut queue: SharedUdpQueue<N> = self.get_shared_queue(&qd)?;
+
+        Ok(Box::pin(async move {
+            match queue.pop(size, yielder).await {
+                Ok((addr, buf)) => (qd, OperationResult::Pop(Some(addr), buf)),
+                Err(e) => (qd, OperationResult::Failed(e)),
+            }
+        }))
     }
 
     /// Consumes the payload from a buffer.

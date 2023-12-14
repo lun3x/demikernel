@@ -45,6 +45,10 @@ BUILD_DIR = $(MAKEDIR)\target\release
 BUILD_DIR = $(MAKEDIR)\target\debug
 !endif
 
+!ifndef INPUT_DIR
+INPUT_DIR = $(MAKEDIR)\nettest\input
+!endif
+
 #=======================================================================================================================
 # Toolchain Configuration
 #=======================================================================================================================
@@ -227,12 +231,16 @@ PEER = server
 TEST = udp-push-pop
 !endif
 
+!ifndef TEST_INTEGRATION
+TEST_INTEGRATION = tcp-test
+!endif
+
 # Runs system tests.
 test-system: test-system-rust
 
 # Rust system tests.
 test-system-rust:
-	$(BINDIR)/examples/rust/$(TEST).exe $(ARGS)
+	$(BINDIR)\examples\rust\$(TEST).exe $(ARGS)
 
 # Runs unit tests.
 test-unit: test-unit-rust
@@ -243,6 +251,7 @@ test-unit-c: all-tests-c
 
 # Rust unit tests.
 test-unit-rust:
+	set INPUT_DIR=$(INPUT_DIR)
 	$(CARGO) test --lib $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
 	$(CARGO) test --test udp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
 	$(CARGO) test --test tcp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
@@ -252,3 +261,7 @@ test-unit-rust:
 	$(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_single_big
 	$(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_tight_big
 	$(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_decoupled_big
+
+# Runs Rust integration tests.
+test-integration-rust:
+	$(CARGO) test --test $(TEST_INTEGRATION) $(CARGO_FLAGS) $(CARGO_FEATURES) -- $(ARGS)

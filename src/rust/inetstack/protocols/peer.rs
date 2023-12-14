@@ -21,7 +21,6 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        timer::TimerRc,
         SharedBox,
         SharedDemiRuntime,
     },
@@ -46,7 +45,6 @@ impl<const N: usize> Peer<N> {
     pub fn new(
         runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
-        clock: TimerRc,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
         udp_config: UdpConfig,
@@ -58,7 +56,6 @@ impl<const N: usize> Peer<N> {
         let udp: SharedUdpPeer<N> = SharedUdpPeer::new(
             runtime.clone(),
             transport.clone(),
-            rng_seed,
             local_link_addr,
             local_ipv4_addr,
             udp_offload_checksum,
@@ -67,7 +64,6 @@ impl<const N: usize> Peer<N> {
         let icmpv4: SharedIcmpv4Peer<N> = SharedIcmpv4Peer::new(
             runtime.clone(),
             transport.clone(),
-            clock.clone(),
             local_link_addr,
             local_ipv4_addr,
             arp.clone(),
@@ -76,7 +72,6 @@ impl<const N: usize> Peer<N> {
         let tcp: SharedTcpPeer<N> = SharedTcpPeer::new(
             runtime.clone(),
             transport.clone(),
-            clock.clone(),
             local_link_addr,
             local_ipv4_addr,
             tcp_config,

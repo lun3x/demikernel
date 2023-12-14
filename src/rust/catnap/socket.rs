@@ -125,14 +125,15 @@ impl Socket {
                                 let errno: libc::c_int = *libc::__errno_location();
                                 warn!("cannot set TCP_NONDELAY option (errno={:?})", errno);
                             }
+                            // Only set reuseport on TCP sockets
+                            if linux::set_so_reuseport(fd) != 0 {
+                                let errno: libc::c_int = *libc::__errno_location();
+                                warn!("cannot set SO_REUSEPORT option (errno={:?})", errno);
+                            }
                         }
                         if linux::set_nonblock(fd) != 0 {
                             let errno: libc::c_int = *libc::__errno_location();
                             warn!("cannot set O_NONBLOCK option (errno={:?})", errno);
-                        }
-                        if linux::set_so_reuseport(fd) != 0 {
-                            let errno: libc::c_int = *libc::__errno_location();
-                            warn!("cannot set SO_REUSEPORT option (errno={:?})", errno);
                         }
                     }
 

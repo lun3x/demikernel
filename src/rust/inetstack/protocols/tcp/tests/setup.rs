@@ -601,7 +601,7 @@ pub fn connection_setup<const N: usize>(
         .remove_coroutine_with_qtoken(connect_qt)
         .get_result()
     {
-        Some((_, OperationResult::Connect)) => {},
+        Some((_, OperationResult::Connect(_))) => {},
         _ => anyhow::bail!("connect should have completed"),
     };
 

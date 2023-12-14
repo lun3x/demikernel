@@ -266,8 +266,16 @@ impl SharedCatnapLibOS {
         // Wait for connect operation to complete.
         match queue.connect_coroutine(remote, yielder).await {
             Ok(()) => {
+                let local = match queue
+                    .local()
+                    .expect("We should have allocated endpoints when we allocated the coroutine")
+                {
+                    SocketAddr::V4(addr) => addr,
+                    SocketAddr::V6(_) => unimplemented!(),
+                };
+
                 // TODO: Do we need to add this to socket id to queue descriptor table?
-                (qd, OperationResult::Connect)
+                (qd, OperationResult::Connect(local))
             },
             Err(e) => {
                 warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);

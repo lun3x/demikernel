@@ -17,6 +17,7 @@ pub use self::{
     },
     ops::{
         demi_accept_result_t,
+        demi_connect_result_t,
         demi_opcode_t,
         demi_qr_value_t,
         demi_qresult_t,

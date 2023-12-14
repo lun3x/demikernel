@@ -94,6 +94,7 @@ use self::{
     scheduler::YielderHandle,
     types::{
         demi_accept_result_t,
+        demi_connect_result_t,
         demi_qr_value_t,
         demi_qresult_t,
     },
@@ -470,12 +471,18 @@ impl SharedDemiRuntime {
 
     pub fn pack_result(&self, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
         match result {
-            OperationResult::Connect => demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: 0,
-                qr_value: unsafe { mem::zeroed() },
+            OperationResult::Connect(addr) => {
+                let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);
+                let qr_value: demi_qr_value_t = demi_qr_value_t {
+                    cres: demi_connect_result_t { addr: saddr },
+                };
+                demi_qresult_t {
+                    qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
+                    qr_qd: qd.into(),
+                    qr_qt: qt,
+                    qr_ret: 0,
+                    qr_value,
+                }
             },
             OperationResult::Accept((new_qd, addr)) => {
                 let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);

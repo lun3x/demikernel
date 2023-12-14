@@ -158,7 +158,7 @@ fn tcp_establish_connection_unbound() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket on error.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
@@ -234,7 +234,7 @@ fn tcp_establish_connection_bound() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket on error.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
@@ -325,7 +325,7 @@ fn tcp_push_remote() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket on error.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
@@ -686,7 +686,7 @@ fn tcp_bad_connect() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, bad_remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => {
+            OperationResult::Connect(_) => {
                 // Close socket if not error because this test cannot continue.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
                 anyhow::bail!("connect() should have failed")
@@ -700,7 +700,7 @@ fn tcp_bad_connect() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket if not error because this test cannot continue.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
@@ -791,7 +791,7 @@ fn tcp_bad_close() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket if error.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
@@ -896,7 +896,7 @@ fn tcp_bad_push() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket if error.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633
@@ -1038,7 +1038,7 @@ fn tcp_bad_pop() -> Result<()> {
         let qt: QToken = safe_connect(&mut libos, sockqd, remote)?;
         let (_, qr): (QDesc, OperationResult) = safe_wait2(&mut libos, qt)?;
         match qr {
-            OperationResult::Connect => (),
+            OperationResult::Connect(_) => (),
             _ => {
                 // Close socket if error.
                 // FIXME: https://github.com/demikernel/demikernel/issues/633

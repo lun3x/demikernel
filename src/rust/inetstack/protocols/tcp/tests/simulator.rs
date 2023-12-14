@@ -755,8 +755,8 @@ impl Simulation {
                         eprintln!("connection accepted (qd={:?}, addr={:?})", qd, remote_addr);
                         self.remote_qd = Some((self.remote_qd.unwrap().0, Some(remote_qd)));
                     },
-                    crate::OperationResult::Connect => {
-                        eprintln!("connection established (qd={:?})", qd);
+                    crate::OperationResult::Connect(local_addr) => {
+                        eprintln!("connection established (qd={:?}, addr={:?})", qd, local_addr);
                     },
                     crate::OperationResult::Pop(_sockaddr, _data) => {
                         eprintln!("pop completed (qd={:?})", qd);

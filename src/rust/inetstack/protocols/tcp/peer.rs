@@ -311,7 +311,7 @@ impl<const N: usize> SharedTcpPeer<N> {
             .expect("We should have allocated endpoints when we allocated the coroutine");
         // Wait for connect to complete.
         match queue.connect_coroutine(yielder).await {
-            Ok(()) => (qd, OperationResult::Connect),
+            Ok(()) => (qd, OperationResult::Connect(local)), // TODO check if this is correct or we need to get from connect_coroutine
             Err(e) => {
                 self.runtime.remove_socket_id_to_qd(&SocketId::Active(local, remote));
                 (qd, OperationResult::Failed(e))

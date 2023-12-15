@@ -42,6 +42,7 @@ use ::std::{
         DerefMut,
     },
 };
+use std::net::SocketAddrV4;
 
 //======================================================================================================================
 // Structures
@@ -184,16 +185,16 @@ impl SharedCatnapQueue {
 
     /// Asynchronously connects the target queue to a remote address. This function contains all of the single-queue,
     /// asynchronous code necessary to run a connect and any single-queue functionality after the connect completes.
-    pub async fn connect_coroutine(&mut self, remote: SocketAddr, yielder: Yielder) -> Result<(), Fail> {
+    pub async fn connect_coroutine(&mut self, remote: SocketAddr, yielder: Yielder) -> Result<SocketAddrV4, Fail> {
         // Check whether we can connect.
         self.state_machine.may_connect()?;
         match self.transport.clone().connect(&mut self.socket, remote, yielder).await {
-            Ok(()) => {
+            Ok(local) => {
                 // Successfully connected to remote.
                 self.state_machine.prepare(SocketOp::Established)?;
                 self.state_machine.commit();
                 self.remote = Some(remote);
-                Ok(())
+                Ok(local)
             },
             Err(e) => {
                 // If connect does not succeed, we close the socket.

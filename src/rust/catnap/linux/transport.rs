@@ -49,6 +49,7 @@ use ::std::{
         RawFd,
     },
 };
+use std::net::SocketAddrV4;
 
 //======================================================================================================================
 // Constants
@@ -633,13 +634,28 @@ impl SharedCatnapTransport {
         sd: &mut SocketDescriptor,
         remote: SocketAddr,
         yielder: Yielder,
-    ) -> Result<(), Fail> {
+    ) -> Result<SocketAddrV4, Fail> {
         self.data_from_sd(sd).move_socket_to_active();
         self.register_epoll(&sd, (libc::EPOLLIN | libc::EPOLLOUT) as u32)?;
 
         loop {
-            match self.socket_from_sd(sd).connect(&remote.into()) {
-                Ok(()) => return Ok(()),
+            let socket = self.socket_from_sd(sd);
+            match socket.connect(&remote.into()) {
+                Ok(()) => {
+                    let local = match socket.local_addr() {
+                        Ok(addr) => addr
+                            .as_socket_ipv4()
+                            .expect("Unsupported socket type, only IPv4 is supported"),
+                        Err(e) => {
+                            // Check the return error code.
+                            let errno: i32 = get_libc_err(e);
+                            let cause: String = format!("failed to getsockname on socket: {:?}", errno);
+                            error!("connect(): {}", cause);
+                            return Err(Fail::new(errno, &cause));
+                        },
+                    };
+                    return Ok(local);
+                },
                 Err(e) => {
                     // Check the return error code.
                     let errno: i32 = get_libc_err(e);

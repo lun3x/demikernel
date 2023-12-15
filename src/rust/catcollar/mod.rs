@@ -309,19 +309,28 @@ impl CatcollarLibOS {
     ) -> (QDesc, OperationResult) {
         // Handle the result.
         match Self::do_connect(fd, remote, yielder).await {
-            Ok(()) => (qd, OperationResult::Connect),
+            Ok(local) => (qd, OperationResult::Connect(local)),
             Err(e) => (qd, OperationResult::Failed(e)),
         }
     }
 
-    async fn do_connect(fd: RawFd, remote: SocketAddrV4, yielder: Yielder) -> Result<(), Fail> {
+    async fn do_connect(fd: RawFd, remote: SocketAddrV4, yielder: Yielder) -> Result<SocketAddrV4, Fail> {
         let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&remote);
         loop {
             match unsafe { libc::connect(fd, &saddr as *const SockAddr, mem::size_of::<SockAddrIn>() as Socklen) } {
                 // Operation completed.
                 stats if stats == 0 => {
                     trace!("connection established (fd={:?})", fd);
-                    return Ok(());
+                    if let Some(local) = local_addr(fd) {
+                        return Ok(local);
+                    } else {
+                        let errno: libc::c_int = unsafe { *libc::__errno_location() };
+                        let message: String = format!("getsockname(): operation failed (errno={:?})", errno);
+                        if !DemiRuntime::should_retry(errno) {
+                            error!("{}", message);
+                        }
+                        return Err(Fail::new(errno, &message));
+                    }
                 },
                 // Operation not completed, thus parse errno to find out what happened.
                 _ => {
@@ -701,4 +710,15 @@ impl CatcollarLibOS {
             },
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn local_addr(fd: RawFd) -> Option<SocketAddrV4> {
+    let mut saddr: SockAddr = unsafe { mem::zeroed() };
+    let mut addrlen: Socklen = mem::size_of::<SockAddrIn>() as u32;
+    let errno = unsafe { libc::getsockname(fd, &mut saddr as *mut SockAddr, &mut addrlen as *mut u32) };
+    if errno == -1 {
+        return None;
+    }
+    Some(linux::sockaddr_to_socketaddrv4(&saddr))
 }

@@ -47,7 +47,7 @@ nettest = { path = "nettest" }
 dpdk-rs = { path = "dpdk-rs", optional = true }
 
 # Demikernel Organization
-liburing = { git = "https://github.com/demikernel/liburing-rs", rev = "780827ee3f805d94f9909bd47cd925ee8476a64b", optional = true }
+liburing = { git = "https://github.com/lun3x/liburing-rs", branch = "master", optional = true }
 
 # Windows-specific dependencies.
 [target.'cfg(windows)'.dependencies]
@@ -141,7 +141,7 @@ path = "examples/rust/tcp-ping-pong.rs"
 #=======================================================================================================================
 
 [features]
-default = ["catnap-libos"]
+default = ["catcollar-libos"]
 catnap-libos = []
 catpowder-libos = []
 catcollar-libos = ["liburing"]

@@ -119,6 +119,10 @@ impl CatcollarLibOS {
                 // Set socket options.
                 unsafe {
                     if typ == libc::SOCK_STREAM {
+                        if linux::set_so_reuseport(fd) != 0 {
+                            let errno: libc::c_int = *libc::__errno_location();
+                            warn!("cannot set SO_REUSEPORT option (errno={:?})", errno);
+                        }
                         if linux::set_tcp_nodelay(fd) != 0 {
                             let errno: libc::c_int = *libc::__errno_location();
                             warn!("cannot set TCP_NONDELAY option (errno={:?})", errno);
@@ -127,10 +131,6 @@ impl CatcollarLibOS {
                     if linux::set_nonblock(fd) != 0 {
                         let errno: libc::c_int = *libc::__errno_location();
                         warn!("cannot set O_NONBLOCK option (errno={:?})", errno);
-                    }
-                    if linux::set_so_reuseport(fd) != 0 {
-                        let errno: libc::c_int = *libc::__errno_location();
-                        warn!("cannot set SO_REUSEPORT option (errno={:?})", errno);
                     }
                 }
 

@@ -520,12 +520,6 @@ impl SharedCatnapTransport {
         let socket: Socket = match socket2::Socket::new(domain, typ, Some(protocol)) {
             Ok(socket) => {
                 // Set socket options.
-                if let Err(e) = socket.set_reuse_address(true) {
-                    let cause: String = format!("cannot set REUSE_ADDRESS option: {:?}", e);
-                    socket.shutdown(Shutdown::Both)?;
-                    error!("new(): {}", cause);
-                    return Err(Fail::new(get_libc_err(e), &cause));
-                }
                 if let Err(e) = socket.set_nonblocking(true) {
                     let cause: String = format!("cannot set NONBLOCKING option: {:?}", e);
                     socket.shutdown(Shutdown::Both)?;
@@ -535,6 +529,12 @@ impl SharedCatnapTransport {
 
                 // Set TCP socket options
                 if typ == Type::STREAM {
+                    if let Err(e) = socket.set_reuse_address(true) {
+                        let cause: String = format!("cannot set REUSE_ADDRESS option: {:?}", e);
+                        socket.shutdown(Shutdown::Both)?;
+                        error!("new(): {}", cause);
+                        return Err(Fail::new(get_libc_err(e), &cause));
+                    }
                     if let Err(e) = socket.set_nodelay(true) {
                         let cause: String = format!("cannot set TCP_NODELAY option: {:?}", e);
                         socket.shutdown(Shutdown::Both)?;

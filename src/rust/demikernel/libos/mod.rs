@@ -82,15 +82,7 @@ impl LibOS {
         logging::initialize();
 
         // Read in configuration file.
-        let config_path: String = match env::var("CONFIG_PATH") {
-            Ok(config_path) => config_path,
-            Err(_) => {
-                return Err(Fail::new(
-                    libc::EINVAL,
-                    "missing value for CONFIG_PATH environment variable",
-                ))
-            },
-        };
+        let config_path: String = env::var("CONFIG_PATH").unwrap_or("./demikernel.yaml".into());
         let config: Config = Config::new(config_path);
         let runtime: SharedDemiRuntime = SharedDemiRuntime::default();
         // Instantiate LibOS.

@@ -23,6 +23,8 @@ use ::std::{
     os::unix::prelude::RawFd,
 };
 
+use socket2::SockAddr;
+
 //======================================================================================================================
 // Standalone Functions
 //======================================================================================================================
@@ -102,6 +104,13 @@ fn sockaddr_in_to_socketaddrv4(sin: &libc::sockaddr_in) -> SocketAddrV4 {
 pub fn socketaddrv4_to_sockaddr(addr: &SocketAddrV4) -> libc::sockaddr {
     let sin: libc::sockaddr_in = socketaddrv4_to_sockaddr_in(addr);
     unsafe { mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) }
+}
+
+/// Converts a [socket2::SockAddr] to a [libc::sockaddr].
+pub fn sockaddr_to_libcsockaddr(addr: &SockAddr) -> libc::sockaddr {
+    assert_eq!(addr.len(), 16);
+    let bytes = unsafe { std::slice::from_raw_parts(addr.as_ptr().cast(), addr.len() as usize) };
+    unsafe { mem::transmute::<[u8; 16], libc::sockaddr>(bytes.try_into().unwrap()) }
 }
 
 #[cfg(feature = "catcollar-libos")]

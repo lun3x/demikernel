@@ -30,6 +30,7 @@ use ::std::{
         SocketAddrV4,
     },
 };
+use socket2::SockAddr;
 
 //======================================================================================================================
 // Structures
@@ -61,7 +62,7 @@ impl NetworkQueueTable {
     }
 
     /// Checks if the given `local` address is in use.
-    pub fn addr_in_use(&self, local: SocketAddrV4) -> bool {
+    pub fn addr_in_use(&self, local: SockAddr) -> bool {
         for (socket_id, _) in &self.mappings {
             match socket_id {
                 SocketId::Passive(addr) | SocketId::Active(addr, _) if *addr == local => return true,

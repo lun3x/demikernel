@@ -42,7 +42,11 @@ use ::std::{
         DerefMut,
     },
 };
-use std::net::SocketAddrV4;
+use socket2::SockAddr;
+use std::{
+    net::SocketAddrV4,
+    path::PathBuf,
+};
 
 //======================================================================================================================
 // Structures
@@ -57,9 +61,9 @@ pub struct CatnapQueue {
     /// Underlying socket.
     socket: SocketDescriptor,
     /// The local address to which the socket is bound.
-    local: Option<SocketAddr>,
+    local: Option<SockAddr>,
     /// The remote address to which the socket is connected.
-    remote: Option<SocketAddr>,
+    remote: Option<SockAddr>,
     /// Underlying network transport.
     transport: SharedCatnapTransport,
 }
@@ -102,7 +106,7 @@ impl SharedCatnapQueue {
     }
 
     /// Binds the target queue to `local` address.
-    pub fn bind(&mut self, local: SocketAddr) -> Result<(), Fail> {
+    pub fn bind(&mut self, local: SockAddr) -> Result<(), Fail> {
         self.state_machine.prepare(SocketOp::Bind)?;
         // Bind underlying socket.
         match self.transport.clone().bind(&mut self.socket, local) {
@@ -189,6 +193,31 @@ impl SharedCatnapQueue {
         // Check whether we can connect.
         self.state_machine.may_connect()?;
         match self.transport.clone().connect(&mut self.socket, remote, yielder).await {
+            Ok(local) => {
+                // Successfully connected to remote.
+                self.state_machine.prepare(SocketOp::Established)?;
+                self.state_machine.commit();
+                self.remote = Some(remote);
+                Ok(local)
+            },
+            Err(e) => {
+                // If connect does not succeed, we close the socket.
+                self.state_machine.prepare(SocketOp::Closed)?;
+                self.state_machine.commit();
+                Err(e)
+            },
+        }
+    }
+
+    pub async fn connect_path_coroutine(&mut self, remote: PathBuf, yielder: Yielder) -> Result<SocketAddrV4, Fail> {
+        // Check whether we can connect.
+        self.state_machine.may_connect()?;
+        match self
+            .transport
+            .clone()
+            .connect_path(&mut self.socket, remote, yielder)
+            .await
+        {
             Ok(local) => {
                 // Successfully connected to remote.
                 self.state_machine.prepare(SocketOp::Established)?;
@@ -336,11 +365,11 @@ impl SharedCatnapQueue {
         Ok(task_handle.get_task_id().into())
     }
 
-    pub fn local(&self) -> Option<SocketAddr> {
+    pub fn local(&self) -> Option<SockAddr> {
         self.local
     }
 
-    pub fn remote(&self) -> Option<SocketAddr> {
+    pub fn remote(&self) -> Option<SockAddr> {
         self.remote
     }
 }

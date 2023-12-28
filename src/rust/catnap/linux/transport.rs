@@ -49,7 +49,11 @@ use ::std::{
         RawFd,
     },
 };
-use std::net::SocketAddrV4;
+use socket2::SockAddr;
+use std::{
+    net::SocketAddrV4,
+    path::PathBuf,
+};
 
 //======================================================================================================================
 // Constants
@@ -72,7 +76,7 @@ pub type SocketDescriptor = usize;
 /// This structure represents the metadata for a passive listening socket: the socket itself and the queue of incoming connections.
 pub struct PassiveSocketData {
     socket: Socket,
-    accept_queue: AsyncQueue<Result<(Socket, SocketAddr), Fail>>,
+    accept_queue: AsyncQueue<Result<(Socket, SockAddr), Fail>>,
 }
 
 /// This structure represents the metadata for an active established socket: the socket itself and the queue of
@@ -117,8 +121,7 @@ impl PassiveSocketData {
             // Operation completed.
             Ok((new_socket, saddr)) => {
                 trace!("connection accepted ({:?})", new_socket);
-                let addr: SocketAddr = saddr.as_socket().expect("not a SocketAddrV4");
-                self.accept_queue.push(Ok((new_socket, addr)))
+                self.accept_queue.push(Ok((new_socket, saddr)))
             },
             Err(e) => {
                 // Check the return error code.
@@ -133,7 +136,7 @@ impl PassiveSocketData {
     }
 
     /// Block until a new connection arrives.
-    pub async fn accept(&mut self, yielder: Yielder) -> Result<(Socket, SocketAddr), Fail> {
+    pub async fn accept(&mut self, yielder: Yielder) -> Result<(Socket, SockAddr), Fail> {
         self.accept_queue.pop(&yielder).await?
     }
 }
@@ -326,7 +329,7 @@ impl SharedSocketData {
     }
 
     /// Accept a new connection on an passive listening socket.
-    pub async fn accept(&mut self, yielder: Yielder) -> Result<(Socket, SocketAddr), Fail> {
+    pub async fn accept(&mut self, yielder: Yielder) -> Result<(Socket, SockAddr), Fail> {
         match self.deref_mut() {
             SocketData::Inactive(_) => unreachable!("Cannot accept on an inactive socket"),
             SocketData::Active(_) => unreachable!("Cannot accept on an active socket"),
@@ -564,7 +567,7 @@ impl SharedCatnapTransport {
     }
 
     /// Binds a socket to [local] on the underlying network transport.
-    pub fn bind(&mut self, sd: &mut SocketDescriptor, local: SocketAddr) -> Result<(), Fail> {
+    pub fn bind(&mut self, sd: &mut SocketDescriptor, local: SockAddr) -> Result<(), Fail> {
         trace!("Bind to {:?}", local);
         let socket: &mut Socket = self.socket_from_sd(sd);
         if let Err(e) = socket.bind(&local.into()) {
@@ -599,7 +602,7 @@ impl SharedCatnapTransport {
         &mut self,
         sd: &mut SocketDescriptor,
         yielder: Yielder,
-    ) -> Result<(SocketDescriptor, SocketAddr), Fail> {
+    ) -> Result<(SocketDescriptor, SockAddr), Fail> {
         let (new_socket, addr) = self.data_from_sd(sd).accept(yielder).await?;
         // Set socket options.
         if let Err(e) = new_socket.set_reuse_address(true) {
@@ -641,6 +644,48 @@ impl SharedCatnapTransport {
         loop {
             let socket = self.socket_from_sd(sd);
             match socket.connect(&remote.into()) {
+                Ok(()) => {
+                    let local = match socket.local_addr() {
+                        Ok(addr) => addr
+                            .as_socket_ipv4()
+                            .expect("Unsupported socket type, only IPv4 is supported"),
+                        Err(e) => {
+                            // Check the return error code.
+                            let errno: i32 = get_libc_err(e);
+                            let cause: String = format!("failed to getsockname on socket: {:?}", errno);
+                            error!("connect(): {}", cause);
+                            return Err(Fail::new(errno, &cause));
+                        },
+                    };
+                    return Ok(local);
+                },
+                Err(e) => {
+                    // Check the return error code.
+                    let errno: i32 = get_libc_err(e);
+                    if DemiRuntime::should_retry(errno) {
+                        self.data_from_sd(sd).push(None, DemiBuffer::new(0), &yielder).await?;
+                    } else {
+                        let cause: String = format!("failed to connect on socket: {:?}", errno);
+                        error!("connect(): {}", cause);
+                        return Err(Fail::new(errno, &cause));
+                    }
+                },
+            }
+        }
+    }
+
+    pub async fn connect_path(
+        &mut self,
+        sd: &mut SocketDescriptor,
+        remote: PathBuf,
+        yielder: Yielder,
+    ) -> Result<SocketAddrV4, Fail> {
+        self.data_from_sd(sd).move_socket_to_active();
+        self.register_epoll(&sd, (libc::EPOLLIN | libc::EPOLLOUT) as u32)?;
+
+        loop {
+            let socket = self.socket_from_sd(sd);
+            match socket.connect(&SockAddr::unix(&remote).expect("Invalid unix socket path")) {
                 Ok(()) => {
                     let local = match socket.local_addr() {
                         Ok(addr) => addr

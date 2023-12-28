@@ -5,6 +5,8 @@
 // Imports
 //==============================================================================
 
+use socket2::SockAddr;
+
 use crate::runtime::{
     fail::Fail,
     memory::DemiBuffer,
@@ -21,10 +23,10 @@ use ::std::{
 
 #[derive(Clone)]
 pub enum OperationResult {
-    Connect(SocketAddrV4),
-    Accept((QDesc, SocketAddrV4)),
+    Connect(SockAddr),
+    Accept((QDesc, SockAddr)),
     Push,
-    Pop(Option<SocketAddrV4>, DemiBuffer),
+    Pop(Option<SockAddr>, DemiBuffer),
     Close,
     Failed(Fail),
 }

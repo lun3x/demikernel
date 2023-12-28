@@ -12,7 +12,7 @@ pub mod state;
 // Imports
 //======================================================================================================================
 
-use ::std::net::SocketAddrV4;
+use socket2::SockAddr;
 
 //======================================================================================================================
 // Structures
@@ -20,6 +20,6 @@ use ::std::net::SocketAddrV4;
 
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum SocketId {
-    Active(SocketAddrV4, SocketAddrV4),
-    Passive(SocketAddrV4),
+    Active(SockAddr, SockAddr),
+    Passive(SockAddr),
 }

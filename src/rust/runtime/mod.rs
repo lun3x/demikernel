@@ -464,7 +464,7 @@ impl SharedDemiRuntime {
         }
     }
 
-    pub fn addr_in_use(&self, local: SocketAddrV4) -> bool {
+    pub fn addr_in_use(&self, local: socket2::SockAddr) -> bool {
         trace!("Check address in use: {:?}", local);
         self.network_table.addr_in_use(local)
     }
@@ -472,9 +472,9 @@ impl SharedDemiRuntime {
     pub fn pack_result(&self, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
         match result {
             OperationResult::Connect(addr) => {
-                let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);
+                // let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);
                 let qr_value: demi_qr_value_t = demi_qr_value_t {
-                    cres: demi_connect_result_t { addr: saddr },
+                    cres: demi_connect_result_t { addr: addr.into() },
                 };
                 demi_qresult_t {
                     qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,

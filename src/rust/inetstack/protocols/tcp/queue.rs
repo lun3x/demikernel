@@ -408,7 +408,7 @@ impl<const N: usize> SharedTcpQueue<N> {
         }
     }
 
-    pub fn endpoints(&self) -> Result<(SocketAddrV4, SocketAddrV4), Fail> {
+    pub fn endpoints(&self) -> Result<(SockAddr, SockAddr), Fail> {
         match self.socket {
             Socket::Established(ref socket) => Ok(socket.endpoints()),
             Socket::Connecting(ref socket) => Ok(socket.endpoints()),

@@ -65,6 +65,8 @@ use ::std::{
     },
     pin::Pin,
 };
+use socket2::SockAddr;
+use std::path::PathBuf;
 
 #[cfg(feature = "profiler")]
 use crate::timer;
@@ -113,7 +115,7 @@ impl SharedCatnapLibOS {
         trace!("socket() domain={:?}, type={:?}, protocol={:?}", domain, typ, _protocol);
 
         // Parse communication domain.
-        if domain != Domain::IPV4 {
+        if (domain != Domain::IPV4) && (domain != Domain::UNIX) {
             return Err(Fail::new(libc::ENOTSUP, "communication domain not supported"));
         }
 
@@ -132,28 +134,29 @@ impl SharedCatnapLibOS {
 
     /// Binds a socket to a local endpoint. This function contains the libOS-level functionality needed to bind a
     /// SharedCatnapQueue to a local address.
-    pub fn bind(&mut self, qd: QDesc, local: SocketAddr) -> Result<(), Fail> {
+    pub fn bind(&mut self, qd: QDesc, local: SockAddr) -> Result<(), Fail> {
         trace!("bind() qd={:?}, local={:?}", qd, local);
 
-        let localv4: SocketAddrV4 = unwrap_socketaddr(local)?;
-        // Check if we are binding to the wildcard address.
-        // FIXME: https://github.com/demikernel/demikernel/issues/189
-        if localv4.ip() == &Ipv4Addr::UNSPECIFIED {
-            let cause: String = format!("cannot bind to wildcard address (qd={:?})", qd);
-            error!("bind(): {}", cause);
-            return Err(Fail::new(libc::ENOTSUP, &cause));
-        }
+        if let Some(localv4) = local.as_socket_ipv4() {
+            // Check if we are binding to the wildcard address.
+            // FIXME: https://github.com/demikernel/demikernel/issues/189
+            if localv4.ip() == &Ipv4Addr::UNSPECIFIED {
+                let cause: String = format!("cannot bind to wildcard address (qd={:?})", qd);
+                error!("bind(): {}", cause);
+                return Err(Fail::new(libc::ENOTSUP, &cause));
+            }
 
-        // Check if we are binding to the wildcard port.
-        // FIXME: https://github.com/demikernel/demikernel/issues/582
-        if local.port() == 0 {
-            let cause: String = format!("cannot bind to port 0 (qd={:?})", qd);
-            error!("bind(): {}", cause);
-            return Err(Fail::new(libc::ENOTSUP, &cause));
+            // Check if we are binding to the wildcard port.
+            // FIXME: https://github.com/demikernel/demikernel/issues/582
+            if localv4.port() == 0 {
+                let cause: String = format!("cannot bind to port 0 (qd={:?})", qd);
+                error!("bind(): {}", cause);
+                return Err(Fail::new(libc::ENOTSUP, &cause));
+            }
         }
 
         // Check wether the address is in use.
-        if self.runtime.addr_in_use(localv4) {
+        if self.runtime.addr_in_use(local) {
             let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
             error!("bind(): {}", &cause);
             return Err(Fail::new(libc::EADDRINUSE, &cause));
@@ -215,15 +218,12 @@ impl SharedCatnapLibOS {
                 // TODO: Do we need to add this to the socket id to queue descriptor table?
                 // It is safe to call except here because the new queue is connected and it should be connected to a
                 // remote address.
-                let addr: SocketAddr = new_queue
+                let addr: SockAddr = new_queue
                     .remote()
                     .expect("An accepted socket must have a remote address");
                 let new_qd: QDesc = self.runtime.alloc_queue(new_queue);
                 // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
-                (
-                    qd,
-                    OperationResult::Accept((new_qd, unwrap_socketaddr(addr).expect("we only support IPv4"))),
-                )
+                (qd, OperationResult::Accept((new_qd, addr)))
             },
             Err(e) => {
                 warn!("accept() listening_qd={:?}: {:?}", qd, &e);
@@ -245,6 +245,23 @@ impl SharedCatnapLibOS {
             let yielder: Yielder = Yielder::new();
             let yielder_handle: YielderHandle = yielder.get_handle();
             let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().connect_coroutine(qd, remote, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
+        };
+
+        queue.connect(coroutine_constructor)
+    }
+
+    pub fn connect_path(&mut self, qd: QDesc, remote: PathBuf) -> Result<QToken, Fail> {
+        trace!("connect_path() qd={:?}, remote={:?}", qd, remote);
+
+        // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("Catnap::connect for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().connect_path_coroutine(qd, remote, yielder));
             self.runtime
                 .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
@@ -276,6 +293,27 @@ impl SharedCatnapLibOS {
         }
     }
 
+    async fn connect_path_coroutine(self, qd: QDesc, remote: PathBuf, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedCatnapQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedCatnapQueue = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue.clone(),
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for connect operation to complete.
+        match queue.connect_path_coroutine(remote, yielder).await {
+            Ok(local) => {
+                // TODO: Do we need to add this to socket id to queue descriptor table?
+                (qd, OperationResult::Connect(local))
+            },
+            Err(e) => {
+                warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);
+                (qd, OperationResult::Failed(e))
+            },
+        }
+    }
+
     /// Synchronously closes a SharedCatnapQueue and its underlying POSIX socket.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
         trace!("close() qd={:?}", qd);
@@ -286,8 +324,7 @@ impl SharedCatnapLibOS {
 
         // If the queue was bound, remove from the socket id to queue descriptor table.
         if let Some(local) = queue.local() {
-            self.runtime
-                .remove_socket_id_to_qd(&SocketId::Passive(unwrap_socketaddr(local)?));
+            self.runtime.remove_socket_id_to_qd(&SocketId::Passive(local));
         }
 
         // Remove the queue from the queue table.

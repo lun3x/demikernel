@@ -37,6 +37,7 @@ use ::std::{
     net::SocketAddrV4,
     time::Duration,
 };
+use socket2::SockAddr;
 
 #[derive(Clone)]
 pub struct EstablishedSocket<const N: usize> {

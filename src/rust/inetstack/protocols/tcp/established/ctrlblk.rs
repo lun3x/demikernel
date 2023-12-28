@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use socket2::SockAddr;
+
 use super::{
     congestion_control::{
         self,

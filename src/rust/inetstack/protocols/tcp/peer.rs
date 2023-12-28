@@ -46,6 +46,7 @@ use ::rand::{
     Rng,
     SeedableRng,
 };
+use socket2::SockAddr;
 
 use ::std::{
     net::{
@@ -306,7 +307,7 @@ impl<const N: usize> SharedTcpPeer<N> {
             Ok(queue) => queue,
             Err(e) => return (qd, OperationResult::Failed(e)),
         };
-        let (local, remote): (SocketAddrV4, SocketAddrV4) = queue
+        let (local, remote): (SockAddr, SockAddr) = queue
             .endpoints()
             .expect("We should have allocated endpoints when we allocated the coroutine");
         // Wait for connect to complete.

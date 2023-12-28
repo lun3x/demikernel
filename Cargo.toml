@@ -43,7 +43,7 @@ yaml-rust = "0.4.5"
 x86 = "0.52.0"
 
 # Local crates.
-nettest = { path = "nettest" }
+# nettest = { path = "nettest" }
 dpdk-rs = { path = "dpdk-rs", optional = true }
 
 # Demikernel Organization

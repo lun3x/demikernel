@@ -8,29 +8,42 @@
 use crate::{
     inetstack::{
         protocols::{
-            ethernet2::EtherType2,
+            ethernet2::{
+                EtherType2,
+                Ethernet2Header,
+            },
+            ip::IpProtocol,
+            ipv4::Ipv4Header,
             tcp::segment::{
+                TcpHeader,
                 TcpOptions2,
+                TcpSegment,
                 MAX_TCP_OPTIONS,
             },
         },
-        test_helpers::SharedTestRuntime,
-    },
-    runtime::network::{
-        config::{
-            ArpConfig,
-            TcpConfig,
-            UdpConfig,
+        test_helpers::{
+            self,
+            engine::{
+                SharedEngine,
+                DEFAULT_TIMEOUT,
+            },
+            runtime::SharedTestRuntime,
         },
-        consts::RECEIVE_BATCH_SIZE,
+    },
+    runtime::{
+        memory::DemiBuffer,
+        network::PacketBuf,
+        OperationResult,
     },
     MacAddress,
+    QDesc,
     QToken,
 };
 use anyhow::Result;
 use nettest::glue::{
     AcceptArgs,
     BindArgs,
+    CloseArgs,
     ConnectArgs,
     Event,
     ListenArgs,
@@ -42,10 +55,7 @@ use nettest::glue::{
     TcpPacket,
 };
 use std::{
-    collections::{
-        HashMap,
-        VecDeque,
-    },
+    collections::VecDeque,
     env,
     fs::{
         DirEntry,
@@ -59,34 +69,12 @@ use std::{
         Ipv4Addr,
         SocketAddrV4,
     },
-    path::PathBuf,
-    time::{
-        Duration,
-        Instant,
+    path::{
+        self,
+        Path,
+        PathBuf,
     },
-};
-
-use crate::{
-    inetstack::{
-        protocols::{
-            ethernet2::Ethernet2Header,
-            ip::IpProtocol,
-            ipv4::Ipv4Header,
-            tcp::segment::{
-                TcpHeader,
-                TcpSegment,
-            },
-        },
-        test_helpers::{
-            self,
-            SharedEngine,
-        },
-    },
-    runtime::{
-        memory::DemiBuffer,
-        network::PacketBuf,
-    },
-    QDesc,
+    time::Instant,
 };
 
 //======================================================================================================================
@@ -106,11 +94,11 @@ fn test_simulation() -> Result<()> {
     let remote_ephemeral_port: u16 = 49152;
     let remote_ipv4: Ipv4Addr = test_helpers::BOB_IPV4;
 
-    let input_path: String = match env::var("INPUT_DIR") {
+    let input_path: String = match env::var("INPUT") {
         Ok(config_path) => config_path,
         Err(e) => {
-            let cause: String = format!("missing INPUT_DIR environment variable (err={:?})", e);
-            eprintln!("test_simulation(): {:?}", cause);
+            let cause: String = format!("missing INPUT environment variable (err={:?})", e);
+            warn!("test_simulation(): {:?}", cause);
             anyhow::bail!(cause);
         },
     };
@@ -119,12 +107,12 @@ fn test_simulation() -> Result<()> {
 
     if tests.is_empty() {
         let cause: String = format!("no tests found under {:?}", input_path);
-        eprintln!("test_simulation(): {:?}", cause);
+        warn!("test_simulation(): {:?}", cause);
         return Ok(());
     }
 
     for test in &tests {
-        println!("Running test: {:?}", test);
+        eprintln!("running test case: {:?}", test);
 
         let mut simulation: Simulation = Simulation::new(
             test,
@@ -146,25 +134,37 @@ fn test_simulation() -> Result<()> {
 // Collect all files under 'test_path'.
 fn collect_tests(test_path: &str) -> Result<Vec<String>> {
     let mut files: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(test_path)? {
-        let entry: DirEntry = entry?;
-        // Skip directories.
-        if entry.file_type()?.is_dir() {
-            continue;
+    let path: &Path = path::Path::new(test_path);
+    // Check if path is a directory.
+    if path.is_dir() {
+        // It is, so recursively collect all files under it.
+        let mut directories: Vec<String> = Vec::new();
+        directories.push(test_path.to_string());
+        // Recurse through all directories.
+        while directories.len() > 0 {
+            let directory: String = directories.pop().unwrap();
+            for entry in std::fs::read_dir(&directory)? {
+                let entry: DirEntry = entry?;
+                let path: PathBuf = entry.path();
+                // Check if path is a directory.
+                if path.is_dir() {
+                    // It is, so add it to the list of directories to be processed.
+                    directories.push(path.to_str().unwrap().to_string());
+                } else {
+                    // It is not a directory, so just add the file to the list of files.
+                    let filename: String = path.to_str().unwrap().to_string();
+                    if filename.ends_with(".pkt") {
+                        files.push(filename);
+                    }
+                }
+            }
         }
-
-        // Skip unsupported files.
-        if !entry.file_name().to_str().unwrap().ends_with(".pkt") {
-            continue;
-        }
-
-        let path: PathBuf = entry.path();
-        let path: String = path.to_str().unwrap().to_string();
-        files.push(path);
+        files.sort();
+    } else {
+        // It is not a directory, so just add the file.
+        let filename: String = path.to_str().unwrap().to_string();
+        files.push(filename);
     }
-
-    files.sort();
-
     Ok(files)
 }
 
@@ -182,7 +182,7 @@ struct Simulation {
     remote_port: u16,
     local_qd: Option<(u32, QDesc)>,
     remote_qd: Option<(u32, Option<QDesc>)>,
-    engine: SharedEngine<RECEIVE_BATCH_SIZE>,
+    engine: SharedEngine,
     now: Instant,
     inflight: Option<QToken>,
     steps: Vec<String>,
@@ -202,36 +202,12 @@ impl Simulation {
         remote_ipv4: &Ipv4Addr,
     ) -> Result<Simulation> {
         let now: Instant = Instant::now();
-        const ARP_CACHE_TTL: Duration = Duration::from_secs(600);
-        let request_timeout: Duration = Duration::from_secs(1);
-        let retry_count: usize = 2;
-        let disable_arp: bool = false;
 
-        let arp_config: ArpConfig = Self::new_arp_config(
-            Some(ARP_CACHE_TTL),
-            Some(request_timeout),
-            Some(retry_count),
-            Some(disable_arp),
-            local_mac,
-            local_ipv4,
-            remote_mac,
-            remote_ipv4,
-        );
-        let udp_config: UdpConfig = Self::new_udp_config();
-        let tcp_config: TcpConfig = Self::new_tcp_config();
+        let test_rig: SharedTestRuntime = SharedTestRuntime::new_test(now);
+        let local: SharedEngine = SharedEngine::new(test_helpers::ALICE_CONFIG_PATH, test_rig, now)?;
 
-        let test_rig: SharedTestRuntime = SharedTestRuntime::new(
-            now,
-            arp_config,
-            udp_config,
-            tcp_config,
-            local_mac.clone(),
-            local_ipv4.clone(),
-        );
-        let local: SharedEngine<RECEIVE_BATCH_SIZE> = SharedEngine::new(test_rig)?;
-
-        println!("Local: sockaddr={:?}, macaddr={:?}", local_ipv4, local_mac);
-        println!("Remote: sockaddr={:?}, macaddr={:?}", remote_ipv4, remote_mac);
+        info!("Local: sockaddr={:?}, macaddr={:?}", local_ipv4, local_mac);
+        info!("Remote: sockaddr={:?}, macaddr={:?}", remote_ipv4, remote_mac);
 
         let steps: Vec<String> = Self::read_input_file(&filename)?;
         Ok(Simulation {
@@ -266,52 +242,26 @@ impl Simulation {
         Ok(lines)
     }
 
-    /// Creates a new ARP configuration.
-    fn new_arp_config(
-        cache_ttl: Option<Duration>,
-        request_timeout: Option<Duration>,
-        retry_count: Option<usize>,
-        disable_arp: Option<bool>,
-        local_mac: &MacAddress,
-        local_ipv4: &Ipv4Addr,
-        remote_mac: &MacAddress,
-        remote_ipv4: &Ipv4Addr,
-    ) -> ArpConfig {
-        let mut initial_values: HashMap<std::net::Ipv4Addr, MacAddress> = HashMap::new();
-        initial_values.insert(local_ipv4.clone(), local_mac.clone());
-        initial_values.insert(remote_ipv4.clone(), remote_mac.clone());
-
-        ArpConfig::new(
-            cache_ttl,
-            request_timeout,
-            retry_count,
-            Some(initial_values),
-            disable_arp,
-        )
-    }
-
-    /// Creates a new UDP configuration.
-    fn new_udp_config() -> UdpConfig {
-        UdpConfig::default()
-    }
-
-    /// Creates a new TCP configuration.
-    fn new_tcp_config() -> TcpConfig {
-        TcpConfig::default()
-    }
-
     /// Runs the simulation.
     pub fn run(&mut self, verbose: bool) -> Result<()> {
-        println!("+++++++++++++++++");
         // Process all lines of the source file.
         for step in &self.steps.clone() {
             if verbose {
-                println!("Line: {:?}", step);
+                info!("Line: {:?}", step);
             }
 
             if let Some(event) = nettest::run_parser(&step, verbose)? {
                 self.run_event(&event)?;
             }
+        }
+
+        // Ensure that there are no more events to be processed.
+        let frames: VecDeque<DemiBuffer> = self.engine.pop_all_frames();
+        if !frames.is_empty() {
+            for frame in &frames {
+                info!("run(): {:?}", frame);
+            }
+            anyhow::bail!("run(): unexpected outgoing frames");
         }
 
         Ok(())
@@ -320,8 +270,7 @@ impl Simulation {
     /// Runs an event.
     fn run_event(&mut self, event: &Event) -> Result<()> {
         self.now += event.time;
-        self.engine.get_test_rig().get_runtime().advance_clock(self.now);
-        println!("=================");
+        self.engine.advance_clock(self.now);
 
         match &event.action {
             nettest::glue::Action::SyscallEvent(syscall) => self.run_syscall(syscall)?,
@@ -334,7 +283,7 @@ impl Simulation {
     /// Runs a system call.
     #[allow(unused_variables)]
     fn run_syscall(&mut self, syscall: &SyscallEvent) -> Result<()> {
-        println!("{:?}: {:?}", self.now, syscall);
+        info!("{:?}: {:?}", self.now, syscall);
         match &syscall.syscall {
             // Issue demi_socket().
             nettest::glue::DemikernelSyscall::Socket(args, ret) => self.run_socket_syscall(args, ret.clone())?,
@@ -344,21 +293,19 @@ impl Simulation {
             nettest::glue::DemikernelSyscall::Connect(args, ret) => self.run_connect_syscall(args, ret.clone())?,
             nettest::glue::DemikernelSyscall::Push(args, ret) => self.run_push_syscall(args, ret.clone())?,
             nettest::glue::DemikernelSyscall::Pop(ret) => self.run_pop_syscall(ret.clone())?,
+            nettest::glue::DemikernelSyscall::Wait(args, ret) => self.run_wait_syscall(args, ret.clone())?,
+            nettest::glue::DemikernelSyscall::Close(args, ret) => self.run_close_syscall(args, ret.clone())?,
             nettest::glue::DemikernelSyscall::Unsupported => {
-                eprintln!("Unsupported syscall");
-            },
-            _ => {
-                eprintln!("Unimplemented syscall");
+                error!("Unsupported syscall");
             },
         }
 
-        self.engine.get_test_rig().poll_scheduler();
         Ok(())
     }
 
     /// Runs a packet.
     fn run_packet(&mut self, packet: &PacketEvent) -> Result<()> {
-        println!("{:?}: {:?}", self.now, packet);
+        info!("{:?}: {:?}", self.now, packet);
         match packet {
             nettest::glue::PacketEvent::Tcp(direction, tcp_packet) => match direction {
                 PacketDirection::Incoming => self.run_incoming_packet(tcp_packet)?,
@@ -370,45 +317,45 @@ impl Simulation {
     }
 
     /// Runs a socket system call.
-    fn run_socket_syscall(&mut self, args: &SocketArgs, ret: u32) -> Result<()> {
+    fn run_socket_syscall(&mut self, args: &SocketArgs, ret: i32) -> Result<()> {
         // Check for unsupported socket domain.
         if args.domain != nettest::glue::SocketDomain::AF_INET {
             let cause: String = format!("unsupported domain socket domain (domain={:?})", args.domain);
-            eprintln!("run_socket_syscall(): {:?}", cause);
+            info!("run_socket_syscall(): {:?}", cause);
             anyhow::bail!(cause);
         }
 
         // Check for unsupported socket type.
         if args.typ != nettest::glue::SocketType::SOCK_STREAM {
             let cause: String = format!("unsupported socket type (type={:?})", args.typ);
-            eprintln!("run_socket_syscall(): {:?}", cause);
+            info!("run_socket_syscall(): {:?}", cause);
             anyhow::bail!(cause);
         }
 
         // Check for unsupported socket protocol.
         if args.protocol != nettest::glue::SocketProtocol::IPPROTO_TCP {
             let cause: String = format!("unsupported socket protocol (protocol={:?})", args.protocol);
-            eprintln!("run_socket_syscall(): {:?}", cause);
+            info!("run_socket_syscall(): {:?}", cause);
             anyhow::bail!(cause);
         }
 
         // Issue demi_socket().
         match self.engine.tcp_socket() {
             Ok(qd) => {
-                self.local_qd = Some((ret, qd));
+                self.local_qd = Some((ret as u32, qd));
                 Ok(())
             },
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for socket syscall");
-                eprintln!("run_socket_syscall(): ret={:?}", ret);
+                info!("run_socket_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
     }
 
     /// Runs a bind system call.
-    fn run_bind_syscall(&mut self, args: &BindArgs, ret: u32) -> Result<()> {
+    fn run_bind_syscall(&mut self, args: &BindArgs, ret: i32) -> Result<()> {
         // Extract bind address.
         let local_addr: SocketAddrV4 = match args.addr {
             None => {
@@ -419,7 +366,7 @@ impl Simulation {
             // Custom bind address is not supported.
             Some(addr) => {
                 let cause: String = format!("unsupported bind address (addr={:?})", addr);
-                eprintln!("run_bind_syscall(): {:?}", cause);
+                info!("run_bind_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -430,13 +377,13 @@ impl Simulation {
                 Some((fd, qd)) if fd == local_fd => qd,
                 _ => {
                     let cause: String = format!("local queue descriptor mismatch");
-                    eprintln!("run_bind_syscall(): {:?}", cause);
+                    info!("run_bind_syscall(): {:?}", cause);
                     anyhow::bail!(cause);
                 },
             },
             None => {
                 let cause: String = format!("local queue descriptor musth have been previously assigned");
-                eprintln!("run_bind_syscall(): {:?}", cause);
+                info!("run_bind_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -447,20 +394,20 @@ impl Simulation {
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for bind syscall");
-                eprintln!("run_bind_syscall(): ret={:?}", ret);
+                info!("run_bind_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
     }
 
     /// Runs a listen system call.
-    fn run_listen_syscall(&mut self, args: &ListenArgs, ret: u32) -> Result<()> {
+    fn run_listen_syscall(&mut self, args: &ListenArgs, ret: i32) -> Result<()> {
         // Check if backlog length was informed.
         let backlog: usize = match args.backlog {
             Some(backlog) => backlog,
             None => {
                 let cause: String = format!("backlog length must be informed");
-                eprintln!("run_listen_syscall(): {:?}", cause);
+                info!("run_listen_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -471,13 +418,13 @@ impl Simulation {
                 Some((fd, qd)) if fd == local_fd => qd,
                 _ => {
                     let cause: String = format!("local queue descriptor mismatch");
-                    eprintln!("run_listen_syscall(): {:?}", cause);
+                    info!("run_listen_syscall(): {:?}", cause);
                     anyhow::bail!(cause);
                 },
             },
             None => {
                 let cause: String = format!("local queue descriptor musth have been previously assigned");
-                eprintln!("run_listen_syscall(): {:?}", cause);
+                info!("run_listen_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -488,27 +435,27 @@ impl Simulation {
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for listen syscall");
-                eprintln!("run_listen_syscall(): ret={:?}", ret);
+                info!("run_listen_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
     }
 
     /// Runs an accept system call.
-    fn run_accept_syscall(&mut self, args: &AcceptArgs, ret: u32) -> Result<()> {
+    fn run_accept_syscall(&mut self, args: &AcceptArgs, ret: i32) -> Result<()> {
         // Extract local queue descriptor.
         let local_qd: QDesc = match args.qd {
             Some(local_fd) => match self.local_qd {
                 Some((fd, qd)) if fd == local_fd => qd,
                 _ => {
                     let cause: String = format!("local queue descriptor mismatch");
-                    eprintln!("run_accept_syscall(): {:?}", cause);
+                    info!("run_accept_syscall(): {:?}", cause);
                     anyhow::bail!(cause);
                 },
             },
             None => {
                 let cause: String = format!("local queue descriptor musth have been previously assigned");
-                eprintln!("run_accept_syscall(): {:?}", cause);
+                info!("run_accept_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -516,29 +463,27 @@ impl Simulation {
         // Issue demi_accept().
         match self.engine.tcp_accept(local_qd) {
             Ok(accept_qt) => {
-                self.remote_qd = Some((ret, None));
-
+                self.remote_qd = Some((ret as u32, None));
                 self.inflight = Some(accept_qt);
-
                 Ok(())
             },
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for accept syscall");
-                eprintln!("run_accept_syscall(): ret={:?}", ret);
+                info!("run_accept_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
     }
 
     /// Runs a connect system call.
-    fn run_connect_syscall(&mut self, args: &ConnectArgs, ret: u32) -> Result<()> {
+    fn run_connect_syscall(&mut self, args: &ConnectArgs, ret: i32) -> Result<()> {
         // Extract local queue descriptor.
         let local_qd: QDesc = match self.local_qd {
             Some((_, qd)) => qd,
             None => {
                 let cause: String = format!("local queue descriptor musth have been previously assigned");
-                eprintln!("run_connect_syscall(): {:?}", cause);
+                info!("run_connect_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -552,7 +497,7 @@ impl Simulation {
             Some(addr) => {
                 // Unsupported remote address.
                 let cause: String = format!("unsupported remote address (addr={:?})", addr);
-                eprintln!("run_connect_syscall(): {:?}", cause);
+                info!("run_connect_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -565,20 +510,20 @@ impl Simulation {
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for connect syscall");
-                eprintln!("run_accept_syscall(): ret={:?}", ret);
+                info!("run_accept_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
     }
 
     /// Runs a push system call.
-    fn run_push_syscall(&mut self, args: &PushArgs, ret: u32) -> Result<()> {
+    fn run_push_syscall(&mut self, args: &PushArgs, ret: i32) -> Result<()> {
         // Extract buffer length.
         let buf_len: u16 = match args.len {
             Some(len) => len.try_into()?,
             None => {
                 let cause: String = format!("buffer length must be informed");
-                eprintln!("run_push_syscall(): {:?}", cause);
+                info!("run_push_syscall(): {:?}", cause);
                 anyhow::bail!(cause);
             },
         };
@@ -595,19 +540,23 @@ impl Simulation {
         match self.engine.tcp_push(remote_qd, buf) {
             Ok(push_qt) => {
                 self.inflight = Some(push_qt);
+                // We need an extra poll because we now perform all work for the push inside the asynchronous coroutine.
+                // TODO: Remove this once we separate the poll and advance clock functions.
+                self.engine.poll();
+
                 Ok(())
             },
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for push syscall");
-                eprintln!("run_push_syscall(): ret={:?}", ret);
+                info!("run_push_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
     }
 
     /// Runs a pop system call.
-    fn run_pop_syscall(&mut self, ret: u32) -> Result<()> {
+    fn run_pop_syscall(&mut self, ret: i32) -> Result<()> {
         // Extract remote queue descriptor.
         let remote_qd: QDesc = match self.remote_qd {
             Some((_, qd)) => qd.unwrap(),
@@ -624,7 +573,73 @@ impl Simulation {
             Err(err) if ret as i32 == err.errno => Ok(()),
             _ => {
                 let cause: String = format!("unexpected return for pop syscall");
-                eprintln!("run_pop_syscall(): ret={:?}", ret);
+                info!("run_pop_syscall(): ret={:?}", ret);
+                anyhow::bail!(cause);
+            },
+        }
+    }
+
+    /// Emulates wait system call.
+    fn run_wait_syscall(&mut self, args: &nettest::glue::WaitArgs, ret: i32) -> Result<()> {
+        // Extract queue descriptor.
+        let args_qd: QDesc = match args.qd {
+            Some(qd) => QDesc::from(qd),
+            None => {
+                let cause: String = format!("queue descriptor must be informed");
+                info!("run_wait_syscall(): {:?}", cause);
+                anyhow::bail!(cause);
+            },
+        };
+
+        match self.operation_has_completed() {
+            Ok((qd, qr)) if args_qd == qd => match qr {
+                crate::OperationResult::Accept((remote_qd, remote_addr)) if ret == 0 => {
+                    info!("connection accepted (qd={:?}, addr={:?})", qd, remote_addr);
+                    self.remote_qd = Some((self.remote_qd.unwrap().0, Some(remote_qd)));
+                    Ok(())
+                },
+                crate::OperationResult::Connect => {
+                    info!("connection established as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Pop(_sockaddr, _data) => {
+                    info!("pop completed as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Push => {
+                    info!("push completed as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Close => {
+                    info!("close completed as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Failed(e) if e.errno == -ret as i32 => {
+                    info!("operation failed as expected (qd={:?}, errno={:?})", qd, e.errno);
+                    Ok(())
+                },
+                crate::OperationResult::Failed(e) => {
+                    unreachable!("operation failed unexpectedly (qd={:?}, errno={:?})", qd, e.errno);
+                },
+                _ => unreachable!("unexpected operation has completed coroutine has completed"),
+            },
+            _ => unreachable!("no operation has completed coroutine has completed, but it should"),
+        }
+    }
+
+    fn run_close_syscall(&mut self, args: &CloseArgs, ret: i32) -> Result<()> {
+        // Extract queue descriptor.
+        let args_qd: QDesc = args.qd.into();
+
+        match self.engine.tcp_async_close(args_qd) {
+            Ok(close_qt) => {
+                self.inflight = Some(close_qt);
+                Ok(())
+            },
+            Err(err) if ret as i32 == err.errno => Ok(()),
+            _ => {
+                let cause: String = format!("unexpected return for close syscall");
+                error!("run_close_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
@@ -740,33 +755,7 @@ impl Simulation {
         let buf: DemiBuffer = Self::serialize_segment(segment);
         self.engine.receive(buf)?;
 
-        self.engine.get_test_rig().poll_scheduler();
-
-        if let Ok(Some(qt)) = self.operation_has_completed() {
-            match self
-                .engine
-                .get_test_rig()
-                .get_runtime()
-                .remove_coroutine_with_qtoken(qt)
-                .get_result()
-            {
-                Some((qd, qr)) => match qr {
-                    crate::OperationResult::Accept((remote_qd, remote_addr)) => {
-                        eprintln!("connection accepted (qd={:?}, addr={:?})", qd, remote_addr);
-                        self.remote_qd = Some((self.remote_qd.unwrap().0, Some(remote_qd)));
-                    },
-                    crate::OperationResult::Connect => {
-                        eprintln!("connection established (qd={:?})", qd);
-                    },
-                    crate::OperationResult::Pop(_sockaddr, _data) => {
-                        eprintln!("pop completed (qd={:?})", qd);
-                    },
-                    _ => unreachable!("unexpected operation has completed coroutine has completed"),
-                },
-                _ => unreachable!("no operation has completed coroutine has completed, but it should"),
-            }
-        }
-
+        self.engine.poll();
         Ok(())
     }
 
@@ -850,61 +839,41 @@ impl Simulation {
     }
 
     /// Checks if an operation has completed.
-    fn operation_has_completed(&mut self) -> Result<Option<QToken>> {
-        let has_completed: bool = match self.inflight {
-            Some(qt) => match self.engine.get_test_rig().get_runtime().from_task_id(qt.clone()) {
-                Ok(task_handle) => task_handle.has_completed(),
-                Err(e) => anyhow::bail!("{:?}", e),
-            },
+    fn operation_has_completed(&mut self) -> Result<(QDesc, OperationResult)> {
+        match self.inflight.take() {
+            Some(qt) => Ok(self.engine.wait(qt, DEFAULT_TIMEOUT)?),
             None => anyhow::bail!("should have an inflight queue token"),
-        };
-        if has_completed {
-            Ok(Some(self.inflight.take().unwrap()))
-        } else {
-            Ok(None)
         }
     }
 
     /// Runs an outgoing packet.
     fn run_outgoing_packet(&mut self, tcp_packet: &TcpPacket) -> Result<()> {
-        self.engine.get_test_rig().poll_scheduler();
-
-        let frames: VecDeque<DemiBuffer> = self.engine.get_test_rig().pop_all_frames();
-
-        // FIXME: We currently do not support multi-frame segments.
-        crate::ensure_eq!(frames.len(), 1);
-
-        for bytes in &frames {
-            let (eth2_header, eth2_payload) = Ethernet2Header::parse(bytes.clone())?;
-            self.check_ethernet2_header(&eth2_header)?;
-
-            let (ipv4_header, ipv4_payload) = Ipv4Header::parse(eth2_payload)?;
-            self.check_ipv4_header(&ipv4_header)?;
-
-            let (tcp_header, _) = TcpHeader::parse(&ipv4_header, ipv4_payload, true)?;
-            self.check_tcp_header(&tcp_header, &tcp_packet)?;
-        }
-
-        if let Ok(Some(qt)) = self.operation_has_completed() {
-            match self
-                .engine
-                .get_test_rig()
-                .get_runtime()
-                .remove_coroutine_with_qtoken(qt)
-                .get_result()
-            {
-                Some((qd, qr)) => match qr {
-                    crate::OperationResult::Accept(_) => {
-                        anyhow::bail!("accept should complete on incoming packet (qd={:?})", qd);
-                    },
-                    crate::OperationResult::Push => {
-                        warn!("push should not complete, untill the remote has acknowledged sent data");
-                    },
-                    _ => unreachable!("unexpected operation has completed coroutine has completed"),
-                },
-                _ => unreachable!("no operation has completed coroutine has completed, but it should"),
+        let mut n = 0;
+        let frames = loop {
+            let frames = self.engine.pop_all_frames();
+            if frames.is_empty() {
+                if n > 5 {
+                    anyhow::bail!("did not emit a frame after 5 loops");
+                } else {
+                    self.engine.poll();
+                    n += 1;
+                }
+            } else {
+                // FIXME: We currently do not support multi-frame segments.
+                crate::ensure_eq!(frames.len(), 1);
+                break frames;
             }
-        }
+        };
+        let bytes = &frames[0];
+        let (eth2_header, eth2_payload) = Ethernet2Header::parse(bytes.clone())?;
+        self.check_ethernet2_header(&eth2_header)?;
+
+        let (ipv4_header, ipv4_payload) = Ipv4Header::parse(eth2_payload)?;
+        self.check_ipv4_header(&ipv4_header)?;
+
+        let (tcp_header, tcp_payload) = TcpHeader::parse(&ipv4_header, ipv4_payload, true)?;
+        crate::ensure_eq!(tcp_packet.seqnum.win as usize, tcp_payload.len());
+        self.check_tcp_header(&tcp_header, &tcp_packet)?;
 
         Ok(())
     }

@@ -5,6 +5,7 @@
 // Imports
 //======================================================================================================================
 
+use crate::DEFAULT_TIMEOUT;
 use anyhow::Result;
 use demikernel::{
     demi_sgarray_t,
@@ -16,6 +17,7 @@ use demikernel::{
     QDesc,
     QToken,
 };
+use histogram::Histogram;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -62,6 +64,10 @@ pub struct TcpEchoClient {
     qts: Vec<QToken>,
     /// Reverse lookup table of pending operations.
     qts_reverse: HashMap<QToken, QDesc>,
+    /// Start time.
+    start: Instant,
+    /// Statistics.
+    stats: Histogram,
 }
 
 //======================================================================================================================
@@ -81,6 +87,8 @@ impl TcpEchoClient {
             clients: HashMap::default(),
             qts: Vec::default(),
             qts_reverse: HashMap::default(),
+            start: Instant::now(),
+            stats: Histogram::new(7, 64)?,
         });
     }
 
@@ -91,15 +99,15 @@ impl TcpEchoClient {
         nclients: usize,
         nrequests: Option<usize>,
     ) -> Result<()> {
-        let start: Instant = Instant::now();
         let mut last_log: Instant = Instant::now();
 
         // Open all connections.
         for _ in 0..nclients {
             let sockqd: QDesc = self.libos.socket(AF_INET, SOCK_STREAM, 0)?;
+
             self.clients.insert(sockqd, (vec![0; self.bufsize], 0));
             let qt: QToken = self.libos.connect(sockqd, self.remote)?;
-            let qr: demi_qresult_t = self.libos.wait(qt, None)?;
+            let qr: demi_qresult_t = self.libos.wait(qt, Some(DEFAULT_TIMEOUT))?;
             if qr.qr_opcode != demi_opcode_t::DEMI_OPC_CONNECT {
                 anyhow::bail!("failed to connect to server")
             }
@@ -113,29 +121,41 @@ impl TcpEchoClient {
         loop {
             // Stop: enough packets were echoed.
             if let Some(nrequests) = nrequests {
-                if self.nechoed >= nrequests {
+                if self.nbytes >= nclients * self.bufsize * nrequests {
+                    println!("INFO: stopping, {} bytes transferred", self.nbytes);
                     break;
                 }
             }
 
-            // Stop: all clients ere disconnected.
+            // Stop: all clients were disconnected.
             if self.clients.len() == 0 {
+                println!(
+                    "INFO: stopping, all clients disconnected {} bytes transferred",
+                    self.nbytes
+                );
                 break;
             }
 
             // Dump statistics.
             if let Some(log_interval) = log_interval {
                 if last_log.elapsed() > Duration::from_secs(log_interval) {
-                    let time_elapsed: u64 = (Instant::now() - start).as_secs() as u64;
-                    let nrequests: u64 = (self.nbytes / self.bufsize) as u64;
-                    let rps: u64 = nrequests / time_elapsed;
-                    println!("INFO: {:?} rps", rps);
+                    let time_elapsed: f64 = (Instant::now() - last_log).as_secs() as f64;
+                    let nrequests: f64 = (self.nbytes / self.bufsize) as f64;
+                    let rps: f64 = nrequests / time_elapsed;
+                    println!(
+                        "INFO: {:?} requests, {:2?} rps, p50 {:?} ns, p99 {:?} ns",
+                        nrequests,
+                        rps,
+                        self.stats.percentile(0.50)?.unwrap().start(),
+                        self.stats.percentile(0.99)?.unwrap().start(),
+                    );
                     last_log = Instant::now();
+                    self.nbytes = 0;
                 }
             }
 
             let qr: demi_qresult_t = {
-                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                 self.unregister_operation(index)?;
                 qr
             };
@@ -167,19 +187,20 @@ impl TcpEchoClient {
         nclients: usize,
         nrequests: Option<usize>,
     ) -> Result<()> {
-        let start: Instant = Instant::now();
         let mut last_log: Instant = Instant::now();
 
         // Open several connections.
         for i in 0..nclients {
             let qd: QDesc = self.libos.socket(AF_INET, SOCK_STREAM, 0)?;
+            // Set default linger to a short period, otherwise, this test will take a long time to complete.
+
             let qt: QToken = self.libos.connect(qd, self.remote)?;
             self.register_operation(qd, qt);
 
             // First client connects synchronously.
             if i == 0 {
                 let qr: demi_qresult_t = {
-                    let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                    let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                     self.unregister_operation(index)?;
                     qr
                 };
@@ -199,29 +220,41 @@ impl TcpEchoClient {
         loop {
             // Stop: enough packets were echoed.
             if let Some(nrequests) = nrequests {
-                if self.nechoed >= nrequests {
+                if self.nbytes >= nclients * self.bufsize * nrequests {
+                    println!("INFO: stopping, {} bytes transferred", self.nbytes);
                     break;
                 }
             }
 
-            // Stop: all clients ere disconnected.
+            // Stop: all clients were disconnected.
             if self.clients.len() == 0 {
+                println!(
+                    "INFO: stopping, all clients disconnected {} bytes transferred",
+                    self.nbytes
+                );
                 break;
             }
 
             // Dump statistics.
             if let Some(log_interval) = log_interval {
                 if last_log.elapsed() > Duration::from_secs(log_interval) {
-                    let time_elapsed: u64 = (Instant::now() - start).as_secs() as u64;
-                    let nrequests: u64 = (self.nbytes / self.bufsize) as u64;
-                    let rps: u64 = nrequests / time_elapsed;
-                    println!("INFO: {:?} rps", rps);
+                    let time_elapsed: f64 = (Instant::now() - last_log).as_secs() as f64;
+                    let nrequests: f64 = (self.nbytes / self.bufsize) as f64;
+                    let rps: f64 = nrequests / time_elapsed;
+                    println!(
+                        "INFO: {:?} requests, {:2?} rps, p50 {:?} ns, p99 {:?} ns",
+                        nrequests,
+                        rps,
+                        self.stats.percentile(0.50)?.unwrap().start(),
+                        self.stats.percentile(0.99)?.unwrap().start(),
+                    );
                     last_log = Instant::now();
+                    self.nbytes = 0;
                 }
             }
 
             let qr: demi_qresult_t = {
-                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                 self.unregister_operation(index)?;
                 qr
             };
@@ -254,23 +287,15 @@ impl TcpEchoClient {
         Ok(())
     }
 
-    // Makes a scatter-gather array.
-    fn mksga(&mut self, size: usize, value: u8) -> Result<demi_sgarray_t> {
-        // Allocate scatter-gather array.
-        let sga: demi_sgarray_t = match self.libos.sgaalloc(size) {
-            Ok(sga) => sga,
-            Err(e) => anyhow::bail!("failed to allocate scatter-gather array: {:?}", e),
-        };
-
-        // Ensure that scatter-gather array has the requested size.
-        assert!(sga.sga_segs[0].sgaseg_len as usize == size);
-
-        // Fill in scatter-gather array.
+    /// Creates a scatter-gather-array.
+    fn mksga(&mut self, size: usize) -> Result<demi_sgarray_t> {
+        debug_assert!(size > std::mem::size_of::<u64>());
+        let sga: demi_sgarray_t = self.libos.sgaalloc(size)?;
         let ptr: *mut u8 = sga.sga_segs[0].sgaseg_buf as *mut u8;
         let len: usize = sga.sga_segs[0].sgaseg_len as usize;
         let slice: &mut [u8] = unsafe { slice::from_raw_parts_mut(ptr, len) };
-        slice.fill(value);
-
+        let now: u64 = Instant::now().duration_since(self.start).as_nanos() as u64;
+        slice[0..8].copy_from_slice(&now.to_le_bytes());
         Ok(sga)
     }
 
@@ -294,22 +319,34 @@ impl TcpEchoClient {
             let slice: &mut [u8] = unsafe { slice::from_raw_parts_mut(ptr, len) };
             recvbuf[*index..(*index + len)].copy_from_slice(slice);
 
-            // TODO: Sanity check packet.
-
-            // Free scatter-gather-array.
-            self.libos.sgafree(sga)?;
-
             *index += len;
-            self.nbytes += len;
+
+            // TODO: Sanity check packet.
 
             // Check if there are more bytes to read from this packet.
             if *index < recvbuf.capacity() {
+                // Free scatter-gather-array.
+                self.libos.sgafree(sga)?;
+                self.nbytes += len;
+
                 // There are, thus issue a partial pop.
                 let size: usize = recvbuf.capacity() - *index;
                 self.issue_pop(qd, Some(size))?;
             }
             // Push another packet.
             else {
+                // Read timestamp from recvbuf.
+                let timestamp: u64 = u64::from_le_bytes([
+                    recvbuf[0], recvbuf[1], recvbuf[2], recvbuf[3], recvbuf[4], recvbuf[5], recvbuf[6], recvbuf[7],
+                ]);
+                let now: u64 = Instant::now().duration_since(self.start).as_nanos() as u64;
+                let elapsed: u64 = now - timestamp;
+                self.stats.increment(elapsed)?;
+
+                // Free scatter-gather-array.
+                self.libos.sgafree(sga)?;
+                self.nbytes += len;
+
                 // There aren't, so push another packet.
                 *index = 0;
                 self.nechoed += 1;
@@ -371,8 +408,7 @@ impl TcpEchoClient {
 
     /// Issues a push operation
     fn issue_push(&mut self, qd: QDesc) -> Result<()> {
-        let fill_char: u8 = (self.npushed % (u8::MAX as usize - 1) + 1) as u8;
-        let sga: demi_sgarray_t = self.mksga(self.bufsize, fill_char)?;
+        let sga: demi_sgarray_t = self.mksga(self.bufsize)?;
         let qt: QToken = self.libos.push(qd, &sga)?;
         self.register_operation(qd, qt);
         Ok(())

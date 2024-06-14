@@ -6,14 +6,21 @@
 //==============================================================================
 
 use ::arrayvec::ArrayVec;
-use ::crossbeam_channel;
-use ::demikernel::runtime::{
-    memory::DemiBuffer,
-    network::{
-        NetworkRuntime,
-        PacketBuf,
+use ::demikernel::{
+    demikernel::config::Config,
+    runtime::{
+        fail::Fail,
+        memory::{
+            DemiBuffer,
+            MemoryRuntime,
+        },
+        network::{
+            consts::RECEIVE_BATCH_SIZE,
+            NetworkRuntime,
+            PacketBuf,
+        },
+        SharedObject,
     },
-    SharedObject,
 };
 use ::std::ops::{
     Deref,
@@ -59,7 +66,15 @@ impl SharedDummyRuntime {
 //==============================================================================
 
 /// Network Runtime Trait Implementation for Dummy Runtime
-impl<const N: usize> NetworkRuntime<N> for SharedDummyRuntime {
+impl NetworkRuntime for SharedDummyRuntime {
+    /// Creates a Dummy Runtime.
+    fn new(_config: &Config) -> Result<Self, Fail> {
+        Err(Fail::new(
+            libc::ENOTSUP,
+            "this function is not supported for the dummy runtime",
+        ))
+    }
+
     fn transmit(&mut self, pkt: Box<dyn PacketBuf>) {
         let header_size: usize = pkt.header_size();
         let body_size: usize = pkt.body_size();
@@ -76,7 +91,7 @@ impl<const N: usize> NetworkRuntime<N> for SharedDummyRuntime {
         self.outgoing.try_send(buf).unwrap();
     }
 
-    fn receive(&mut self) -> ArrayVec<DemiBuffer, N> {
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE> {
         let mut out = ArrayVec::new();
         if let Some(buf) = self.incoming.try_recv().ok() {
             out.push(buf);
@@ -84,6 +99,8 @@ impl<const N: usize> NetworkRuntime<N> for SharedDummyRuntime {
         out
     }
 }
+
+impl MemoryRuntime for SharedDummyRuntime {}
 
 impl Deref for SharedDummyRuntime {
     type Target = DummyRuntime;

@@ -25,13 +25,14 @@ endif
 #=======================================================================================================================
 
 export BINDIR ?= $(CURDIR)/bin
-export INCDIR ?= $(CURDIR)/include
+export INCDIR := $(CURDIR)/include
+export LIBDIR ?= $(CURDIR)/lib
 export SRCDIR = $(CURDIR)/src
 export BUILD_DIR := $(CURDIR)/target/release
 ifeq ($(BUILD),dev)
 export BUILD_DIR := $(CURDIR)/target/debug
 endif
-export INPUT_DIR ?= $(CURDIR)/nettest/input
+export INPUT ?= $(CURDIR)/nettest/input
 
 #=======================================================================================================================
 # Toolchain Configuration
@@ -41,19 +42,25 @@ export INPUT_DIR ?= $(CURDIR)/nettest/input
 export CARGO ?= $(shell which cargo || echo "$(HOME)/.cargo/bin/cargo" )
 export CARGO_FLAGS += --profile $(BUILD)
 
+# C
+export CFLAGS := -I $(INCDIR)
+ifeq ($(DEBUG),yes)
+export CFLAGS += -O0
+endif
+
 #=======================================================================================================================
 # Libraries
 #=======================================================================================================================
 
-export DEMIKERNEL_LIB := $(BUILD_DIR)/libdemikernel.so
-export LIBS := $(DEMIKERNEL_LIB)
+export DEMIKERNEL_LIB := libdemikernel.so
+export LIBS := $(BUILD_DIR)/$(DEMIKERNEL_LIB)
 
 #=======================================================================================================================
 # Build Parameters
 #=======================================================================================================================
 
 export LIBOS ?= catnap
-export CARGO_FEATURES := --features=$(LIBOS)-libos
+export CARGO_FEATURES := --features=$(LIBOS)-libos --no-default-features
 
 # Switch for DPDK
 ifeq ($(LIBOS),catnip)
@@ -62,7 +69,7 @@ CARGO_FEATURES += --features=$(DRIVER)
 endif
 
 # Switch for profiler.
-export PROFILER=no
+export PROFILER ?= no
 ifeq ($(PROFILER),yes)
 CARGO_FEATURES += --features=profiler
 endif
@@ -74,6 +81,7 @@ CARGO_FEATURES += $(FEATURES)
 all: init | all-libs all-tests all-examples
 
 init:
+	mkdir -p $(LIBDIR)
 	git config --local core.hooksPath .githooks
 
 # Builds documentation.
@@ -84,7 +92,7 @@ doc:
 install:
 	mkdir -p $(INSTALL_PREFIX)/include $(INSTALL_PREFIX)/lib
 	cp -rf $(INCDIR)/* $(INSTALL_PREFIX)/include/
-	cp -f  $(DEMIKERNEL_LIB) $(INSTALL_PREFIX)/lib/
+	cp -rf  $(LIBDIR)/* $(INSTALL_PREFIX)/lib/
 	cp -f $(CURDIR)/scripts/config/default.yaml $(INSTALL_PREFIX)/config.yaml
 
 #=======================================================================================================================
@@ -92,20 +100,28 @@ install:
 #=======================================================================================================================
 
 # Builds all libraries.
-all-libs: all-libs-demikernel
+all-libs: all-shim all-libs-demikernel
 
 all-libs-demikernel:
 	@echo "LD_LIBRARY_PATH: $(LD_LIBRARY_PATH)"
 	@echo "PKG_CONFIG_PATH: $(PKG_CONFIG_PATH)"
 	@echo "$(CARGO) build --libs $(CARGO_FEATURES) $(CARGO_FLAGS)"
 	$(CARGO) build --lib $(CARGO_FEATURES) $(CARGO_FLAGS)
+	cp -f $(BUILD_DIR)/$(DEMIKERNEL_LIB) $(LIBDIR)/$(DEMIKERNEL_LIB)
+
+all-shim: all-libs-demikernel
+	$(MAKE) -C shim all
 
 clean-libs: clean-libs-demikernel
 
 clean-libs-demikernel:
+	rm -f $(LIBDIR)/$(DEMIKERNEL_LIB)
 	rm -rf target ; \
 	rm -f Cargo.lock ; \
 	$(CARGO) clean
+
+clean-shim:
+	$(MAKE) -C shim clean
 
 #=======================================================================================================================
 # Tests
@@ -157,6 +173,18 @@ clean-examples-rust:
 	$(MAKE) -C examples/rust clean
 
 #=======================================================================================================================
+# Benchmarks
+#=======================================================================================================================
+
+# Builds all C benchmarks
+all-benchmarks-c: all-libs
+	$(MAKE) -C benchmarks all
+
+# Cleans up all C build artifacts for benchmarks.
+clean-benchmarks-c:
+	$(MAKE) -C benchmarks clean
+
+#=======================================================================================================================
 # Check
 #=======================================================================================================================
 
@@ -180,6 +208,8 @@ check-fmt-rust:
 clean: clean-examples clean-tests clean-libs
 
 #=======================================================================================================================
+# Tests
+#=======================================================================================================================
 
 export CONFIG_PATH ?= $(HOME)/config.yaml
 export MTU ?= 1500
@@ -187,6 +217,7 @@ export MSS ?= 1500
 export PEER ?= server
 export TEST ?= udp-push-pop
 export TEST_INTEGRATION ?= tcp-test
+export TEST_UNIT ?=
 export TIMEOUT ?= 120
 
 # Runs system tests.
@@ -200,20 +231,34 @@ test-system-rust:
 test-unit: test-unit-rust
 
 # C unit tests.
-test-unit-c: all-tests $(BINDIR)/syscalls.elf
+test-unit-c: all-tests test-unit-c-sizes test-unit-c-syscalls
+
+test-unit-c-sizes: all-tests $(BINDIR)/sizes.elf
+	timeout $(TIMEOUT) $(BINDIR)/sizes.elf
+
+test-unit-c-syscalls: all-tests $(BINDIR)/syscalls.elf
 	timeout $(TIMEOUT) $(BINDIR)/syscalls.elf
 
 # Rust unit tests.
-test-unit-rust: all-tests-rust
-	timeout $(TIMEOUT) $(CARGO) test --lib $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
-	timeout $(TIMEOUT) $(CARGO) test --test udp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
-	timeout $(TIMEOUT) $(CARGO) test --test tcp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
+test-unit-rust: test-unit-rust-lib test-unit-rust-udp test-unit-rust-tcp
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_single_small
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_tight_small
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_decoupled_small
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_single_big
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_tight_big
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_decoupled_big
+
+# Rust unit tests for the library.
+test-unit-rust-lib: all-tests-rust
+	timeout $(TIMEOUT) $(CARGO) test --lib $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture $(TEST_UNIT)
+
+# Rust unit tests for UDP.
+test-unit-rust-udp: all-tests-rust
+	timeout $(TIMEOUT) $(CARGO) test --test udp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture $(TEST_UNIT)
+
+# Rust unit tests for TCP.
+test-unit-rust-tcp: all-tests-rust
+	timeout $(TIMEOUT) $(CARGO) test --test tcp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture $(TEST_UNIT)
 
 # Runs Rust integration tests.
 test-integration-rust:
@@ -222,3 +267,11 @@ test-integration-rust:
 # Cleans dangling test resources.
 test-clean:
 	rm -f /dev/shm/demikernel-*
+
+#=======================================================================================================================
+# Benchmarks
+#=======================================================================================================================
+
+# C unit benchmarks.
+run-benchmarks-c: all-benchmarks-c $(BINDIR)/syscalls.elf
+	timeout $(TIMEOUT) $(BINDIR)/benchmarks.elf

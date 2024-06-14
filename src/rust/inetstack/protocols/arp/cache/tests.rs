@@ -1,29 +1,36 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use super::*;
-use crate::{
-    inetstack::test_helpers,
-    runtime::timer::SharedTimer,
+//======================================================================================================================
+// Imports
+//======================================================================================================================
+
+use crate::inetstack::{
+    protocols::arp::cache::*,
+    test_helpers,
 };
 use ::anyhow::Result;
-use ::std::time::Instant;
+
+//======================================================================================================================
+// Tests
+//======================================================================================================================
 
 /// Tests that an entry of the ARP Cache gets evicted at the right time.
 #[test]
 fn evict_with_default_ttl() -> Result<()> {
     let now = Instant::now();
+
     let ttl = Duration::from_secs(1);
     let later = now + ttl;
-    let mut clock = SharedTimer::new(now);
 
     // Insert an IPv4 address in the ARP Cache.
-    let mut cache = ArpCache::new(clock.clone(), Some(ttl), None, false);
+    let mut cache = ArpCache::new(now, Some(ttl), None, false);
     cache.insert(test_helpers::ALICE_IPV4, test_helpers::ALICE_MAC);
     crate::ensure_eq!(cache.get(test_helpers::ALICE_IPV4), Some(&test_helpers::ALICE_MAC));
 
     // Advance the internal clock of the cache and clear it.
-    clock.advance_clock(later);
+    // Unclear that this does anything.
+    cache.advance_clock(later);
     cache.clear();
 
     // The IPv4 address must be gone.
@@ -37,14 +44,13 @@ fn evict_with_default_ttl() -> Result<()> {
 fn import() -> Result<()> {
     let now = Instant::now();
     let ttl = Duration::from_secs(1);
-    let clock = SharedTimer::new(now);
 
     // Create an address resolution map.
     let mut map: HashMap<Ipv4Addr, MacAddress> = HashMap::new();
     map.insert(test_helpers::ALICE_IPV4, test_helpers::ALICE_MAC);
 
     // Create an ARP Cache and import address resolution map.
-    let cache = ArpCache::new(clock, Some(ttl), Some(&map), false);
+    let cache = ArpCache::new(now, Some(ttl), Some(&map), false);
 
     // Check if address resolutions are in the ARP Cache.
     crate::ensure_eq!(cache.get(test_helpers::ALICE_IPV4), Some(&test_helpers::ALICE_MAC));
@@ -57,10 +63,9 @@ fn import() -> Result<()> {
 fn export() -> Result<()> {
     let now = Instant::now();
     let ttl = Duration::from_secs(1);
-    let clock = SharedTimer::new(now);
 
     // Insert an IPv4 address in the ARP Cache.
-    let mut cache = ArpCache::new(clock, Some(ttl), None, false);
+    let mut cache = ArpCache::new(now, Some(ttl), None, false);
     cache.insert(test_helpers::ALICE_IPV4, test_helpers::ALICE_MAC);
     crate::ensure_eq!(cache.get(test_helpers::ALICE_IPV4), Some(&test_helpers::ALICE_MAC));
 

@@ -9,16 +9,22 @@
 // TODO: Review if we really care to support this.
 // TODO: Review if fast retransmit should be mixed in with congestion control or not.
 
-use super::{
-    CongestionControl,
-    FastRetransmitRecovery,
-    LimitedTransmit,
-    Options,
-    SlowStartCongestionAvoidance,
-};
+//======================================================================================================================
+// Imports
+//======================================================================================================================
+
 use crate::{
-    inetstack::protocols::tcp::SeqNumber,
-    runtime::watched::SharedWatchedValue,
+    collections::async_value::SharedAsyncValue,
+    inetstack::protocols::tcp::{
+        established::congestion_control::{
+            CongestionControl,
+            FastRetransmitRecovery,
+            LimitedTransmit,
+            Options,
+            SlowStartCongestionAvoidance,
+        },
+        SeqNumber,
+    },
 };
 use ::std::{
     cell::Cell,
@@ -26,7 +32,6 @@ use ::std::{
         max,
         min,
     },
-    convert::TryInto,
     fmt::Debug,
     time::{
         Duration,
@@ -34,12 +39,16 @@ use ::std::{
     },
 };
 
+//======================================================================================================================
+// Structures
+//======================================================================================================================
+
 #[derive(Debug)]
 pub struct Cubic {
     pub mss: u32, // Just for convenience, otherwise we have `as u32` or `.try_into().unwrap()` scattered everywhere...
     // Slow Start / Congestion Avoidance State.
-    pub ca_start: Cell<Instant>, // The time we started the current congestion avoidance.
-    pub cwnd: SharedWatchedValue<u32>, // Congestion window: Max number of bytes that may be in flight ot prevent congestion.
+    pub ca_start: Cell<Instant>,     // The time we started the current congestion avoidance.
+    pub cwnd: SharedAsyncValue<u32>, // Congestion window: Max number of bytes that may be in flight ot prevent congestion.
     pub fast_convergence: bool, // Should we employ the fast convergence algorithm (Only recommended if there are multiple CUBIC streams on the same network, in which case we'll cede capacity to new ones faster).
     pub initial_cwnd: u32,      // The initial value of cwnd, which gets used if the connection ever resets.
     pub last_send_time: Cell<Instant>, // The moment at which we last sent data.
@@ -51,13 +60,17 @@ pub struct Cubic {
 
     // Fast Recovery / Fast Retransmit State
     pub duplicate_ack_count: Cell<u32>, // The number of consecutive duplicate ACKs we've received.
-    pub fast_retransmit_now: SharedWatchedValue<bool>, // Flag to cause the retransmitter to retransmit a segment now.
+    pub fast_retransmit_now: SharedAsyncValue<bool>, // Flag to cause the retransmitter to retransmit a segment now.
     pub in_fast_recovery: Cell<bool>,   // Are we currently in the `fast recovery` algorithm.
     pub prev_ack_seq_no: Cell<SeqNumber>, // The previous highest ACK sequence number.
     pub recover: Cell<SeqNumber>, // If we receive dup ACKs with sequence numbers greater than this we'll attempt fast recovery.
 
-    pub limited_transmit_cwnd_increase: SharedWatchedValue<u32>, // The amount by which cwnd should be increased due to the limited transit algorithm.
+    pub limited_transmit_cwnd_increase: SharedAsyncValue<u32>, // The amount by which cwnd should be increased due to the limited transit algorithm.
 }
+
+//======================================================================================================================
+// Structures
+//======================================================================================================================
 
 impl CongestionControl for Cubic {
     fn new(mss: usize, seq_no: SeqNumber, options: Option<Options>) -> Box<dyn CongestionControl> {
@@ -76,7 +89,7 @@ impl CongestionControl for Cubic {
             mss,
             // Slow Start / Congestion Avoidance State
             ca_start: Cell::new(Instant::now()), // Record the start time of the congestion avoidance period.
-            cwnd: SharedWatchedValue::new(initial_cwnd),
+            cwnd: SharedAsyncValue::new(initial_cwnd),
             fast_convergence,
             initial_cwnd,
             last_send_time: Cell::new(Instant::now()),
@@ -87,15 +100,19 @@ impl CongestionControl for Cubic {
             last_congestion_was_rto: Cell::new(false),
 
             in_fast_recovery: Cell::new(false),
-            fast_retransmit_now: SharedWatchedValue::new(false),
+            fast_retransmit_now: SharedAsyncValue::new(false),
             recover: Cell::new(seq_no), // Recover set to initial send sequence number according to RFC6582.
             prev_ack_seq_no: Cell::new(seq_no), // RFC6582 doesn't specify the initial value, but this seems sensible.
             duplicate_ack_count: Cell::new(0),
 
-            limited_transmit_cwnd_increase: SharedWatchedValue::new(0),
+            limited_transmit_cwnd_increase: SharedAsyncValue::new(0),
         })
     }
 }
+
+//======================================================================================================================
+// Associated Functions
+//======================================================================================================================
 
 impl Cubic {
     const BETA_CUBIC: f32 = 0.7;
@@ -271,8 +288,12 @@ impl Cubic {
     }
 }
 
+//======================================================================================================================
+// Trait Implementations
+//======================================================================================================================
+
 impl SlowStartCongestionAvoidance for Cubic {
-    fn get_cwnd(&self) -> SharedWatchedValue<u32> {
+    fn get_cwnd(&self) -> SharedAsyncValue<u32> {
         self.cwnd.clone()
     }
 
@@ -289,8 +310,8 @@ impl SlowStartCongestionAvoidance for Cubic {
     fn on_send(&mut self, rto: Duration, num_bytes_sent: u32) {
         self.last_send_time.set(Instant::now());
         self.rtt_at_last_send.set(rto);
-        self.limited_transmit_cwnd_increase
-            .set_without_notify(self.limited_transmit_cwnd_increase.get().saturating_sub(num_bytes_sent));
+        let new_value: u32 = self.limited_transmit_cwnd_increase.get().saturating_sub(num_bytes_sent);
+        self.limited_transmit_cwnd_increase.set_without_notify(new_value);
     }
 
     fn on_ack_received(&mut self, rto: Duration, send_unacked: SeqNumber, send_next: SeqNumber, ack_seq_no: SeqNumber) {
@@ -328,7 +349,7 @@ impl FastRetransmitRecovery for Cubic {
         self.duplicate_ack_count.get()
     }
 
-    fn get_retransmit_now_flag(&self) -> SharedWatchedValue<bool> {
+    fn get_retransmit_now_flag(&self) -> SharedAsyncValue<bool> {
         self.fast_retransmit_now.clone()
     }
 
@@ -341,7 +362,7 @@ impl FastRetransmitRecovery for Cubic {
 }
 
 impl LimitedTransmit for Cubic {
-    fn get_limited_transmit_cwnd_increase(&self) -> SharedWatchedValue<u32> {
+    fn get_limited_transmit_cwnd_increase(&self) -> SharedAsyncValue<u32> {
         self.limited_transmit_cwnd_increase.clone()
     }
 }

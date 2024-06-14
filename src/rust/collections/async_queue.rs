@@ -6,11 +6,9 @@
 //======================================================================================================================
 
 use crate::runtime::{
+    conditional_yield_with_timeout,
     fail::Fail,
-    scheduler::{
-        Yielder,
-        YielderHandle,
-    },
+    SharedConditionVariable,
     SharedObject,
 };
 use ::std::{
@@ -25,8 +23,15 @@ use ::std::{
         Deref,
         DerefMut,
     },
-    vec::Vec,
+    time::Duration,
 };
+
+//======================================================================================================================
+// Constants
+//======================================================================================================================
+
+// The following value was chosen arbitrarily.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 //======================================================================================================================
 // Structures
@@ -36,10 +41,9 @@ use ::std::{
 /// pop, if the queue is empty, the coroutine will yield until there is data to be read.
 pub struct AsyncQueue<T> {
     queue: VecDeque<T>,
-    waiters: Vec<YielderHandle>,
+    cond_var: SharedConditionVariable,
 }
 
-#[derive(Clone)]
 pub struct SharedAsyncQueue<T>(SharedObject<AsyncQueue<T>>);
 
 //======================================================================================================================
@@ -52,7 +56,7 @@ impl<T> AsyncQueue<T> {
     pub fn with_capacity(size: usize) -> Self {
         Self {
             queue: VecDeque::<T>::with_capacity(size),
-            waiters: Vec::<YielderHandle>::new(),
+            cond_var: SharedConditionVariable::default(),
         }
     }
 
@@ -60,38 +64,26 @@ impl<T> AsyncQueue<T> {
     /// add bounds checking in the future.
     pub fn push(&mut self, item: T) {
         self.queue.push_back(item);
-        if let Some(mut handle) = self.waiters.pop() {
-            handle.wake_with(Ok(()));
-        }
+        self.cond_var.signal();
     }
 
     pub fn push_front(&mut self, item: T) {
         self.queue.push_front(item);
-        if let Some(mut handle) = self.waiters.pop() {
-            handle.wake_with(Ok(()));
-        }
+        self.cond_var.signal();
     }
 
     /// Pop from an async queue. If the queue is empty, this function blocks until it finds something in the queue.
-    pub async fn pop(&mut self, yielder: &Yielder) -> Result<T, Fail> {
-        match self.queue.pop_front() {
-            Some(item) => Ok(item),
-            None => {
-                let handle: YielderHandle = yielder.get_handle();
-                self.waiters.push(handle);
-                match yielder.yield_until_wake().await {
-                    Ok(()) => match self.queue.pop_front() {
-                        Some(item) => Ok(item),
-                        None => {
-                            let cause: &str = "Spurious wake up!";
-                            warn!("pop(): {}", cause);
-                            Err(Fail::new(libc::EAGAIN, cause))
-                        },
-                    },
-                    Err(e) => Err(e),
+    pub async fn pop(&mut self, timeout: Option<Duration>) -> Result<T, Fail> {
+        let wait_condition = async {
+            loop {
+                if let Some(item) = self.queue.pop_front() {
+                    return item;
+                } else {
+                    self.cond_var.wait().await;
                 }
-            },
-        }
+            }
+        };
+        conditional_yield_with_timeout(wait_condition, timeout.unwrap_or(DEFAULT_TIMEOUT)).await
     }
 
     /// Try to get the head of the queue.
@@ -138,8 +130,8 @@ impl<T> SharedAsyncQueue<T> {
 impl<T> Default for AsyncQueue<T> {
     fn default() -> Self {
         Self {
-            queue: VecDeque::<T>::new(),
-            waiters: Vec::<YielderHandle>::new(),
+            queue: VecDeque::<T>::default(),
+            cond_var: SharedConditionVariable::default(),
         }
     }
 }
@@ -160,5 +152,11 @@ impl<T> Deref for SharedAsyncQueue<T> {
 impl<T> DerefMut for SharedAsyncQueue<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.deref_mut()
+    }
+}
+
+impl<T> Clone for SharedAsyncQueue<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }

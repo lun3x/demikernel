@@ -103,46 +103,39 @@ impl<T> PinSlab<T> {
         Some(key)
     }
 
-    /// Access the given key as a pinned mutable value.
-    pub fn get_pin_mut(&mut self, key: usize) -> Option<Pin<&mut T>> {
+    /// Checks whether the given slot is occupied.
+    pub fn contains(&self, key: usize) -> bool {
+        // We are just using this to check the existance of an entry in this slot or not.
+        self.internal_get(key).is_some()
+    }
+
+    /// Gets a read only unpinned reference.
+    pub fn get(&self, key: usize) -> Option<&T> {
+        self.internal_get(key)
+    }
+
+    #[allow(unused)]
+    /// Gets a read only pinned reference.
+    pub fn get_pin(&self, key: usize) -> Option<Pin<&T>> {
+        let entry: &T = self.internal_get(key)?;
         // Safety: all storage is pre-allocated in chunks, and each chunk
         // doesn't move. We only provide mutators to drop the storage through
         // `remove` (but it doesn't return it).
-        unsafe {
-            let entry: &mut T = self.internal_get_mut(key)?;
-            Some(Pin::new_unchecked(entry))
-        }
+        unsafe { Some(Pin::new_unchecked(entry)) }
     }
 
-    /// Get a reference to the value at the given slot.
-    pub fn get(&self, key: usize) -> Option<&T> {
-        // Safety: We only use this to acquire an immutable reference.
-        // The internal calculation guarantees that the key is in bounds.
-        unsafe { self.internal_get(key) }
-    }
-
-    /// Get a mutable reference to the value at the given slot.
-    #[inline(always)]
-    unsafe fn internal_get_mut(&mut self, key: usize) -> Option<&mut T> {
-        let (slot, offset, len): (usize, usize, usize) = calculate_key(key)?;
-        let slot: NonNull<Entry<T>> = *self.slots.get_mut(slot)?;
-
-        // Safety: all slots are fully allocated and initialized in `new_slot`.
-        // As long as we have access to it, we know that we will only find
-        // initialized entries assuming offset < len.
-        debug_assert!(offset < len);
-
-        let entry: &mut T = match &mut *slot.as_ptr().add(offset) {
-            Entry::Occupied(entry) => entry,
-            _ => return None,
-        };
-
-        Some(entry)
+    /// Access the given key as a pinned mutable value.
+    pub fn get_pin_mut(&mut self, key: usize) -> Option<Pin<&mut T>> {
+        let entry: &mut T = self.internal_get_mut(key)?;
+        // Safety: all storage is pre-allocated in chunks, and each chunk
+        // doesn't move. We only provide mutators to drop the storage through
+        // `remove` (but it doesn't return it).
+        unsafe { Some(Pin::new_unchecked(entry)) }
     }
 
     /// Get a reference to the value at the given slot.
     #[inline(always)]
-    unsafe fn internal_get(&self, key: usize) -> Option<&T> {
+    fn internal_get(&self, key: usize) -> Option<&T> {
         let (slot, offset, len): (usize, usize, usize) = calculate_key(key)?;
         let slot: NonNull<Entry<T>> = *self.slots.get(slot)?;
 
@@ -151,7 +144,26 @@ impl<T> PinSlab<T> {
         // initialized entries assuming offset < len.
         debug_assert!(offset < len);
 
-        let entry: &T = match &*slot.as_ptr().add(offset) {
+        let entry: &T = match unsafe { &*slot.as_ptr().add(offset) } {
+            Entry::Occupied(entry) => entry,
+            _ => return None,
+        };
+
+        Some(entry)
+    }
+
+    /// Get a mutable reference to the value at the given slot.
+    #[inline(always)]
+    fn internal_get_mut(&mut self, key: usize) -> Option<&mut T> {
+        let (slot, offset, len): (usize, usize, usize) = calculate_key(key)?;
+        let slot: NonNull<Entry<T>> = *self.slots.get_mut(slot)?;
+
+        // Safety: all slots are fully allocated and initialized in `new_slot`.
+        // As long as we have access to it, we know that we will only find
+        // initialized entries assuming offset < len.
+        debug_assert!(offset < len);
+
+        let entry: &mut T = match unsafe { &mut *slot.as_ptr().add(offset) } {
             Entry::Occupied(entry) => entry,
             _ => return None,
         };
@@ -307,6 +319,14 @@ fn slot_sizes() -> impl Iterator<Item = usize> {
 
 #[cfg(test)]
 mod tests {
+    use crate::collections::{
+        pin_slab,
+        pin_slab::{
+            calculate_key,
+            PinSlab,
+            FIRST_SLOT_SIZE,
+        },
+    };
     use ::anyhow::Result;
     use ::std::{
         mem,
@@ -317,13 +337,13 @@ mod tests {
     fn slot_sizes() -> Result<()> {
         crate::ensure_eq!(
             vec![
-                super::FIRST_SLOT_SIZE,
-                super::FIRST_SLOT_SIZE,
-                super::FIRST_SLOT_SIZE << 1,
-                super::FIRST_SLOT_SIZE << 2,
-                super::FIRST_SLOT_SIZE << 3
+                FIRST_SLOT_SIZE,
+                FIRST_SLOT_SIZE,
+                FIRST_SLOT_SIZE << 1,
+                FIRST_SLOT_SIZE << 2,
+                FIRST_SLOT_SIZE << 3
             ],
-            super::slot_sizes().take(5).collect::<Vec<_>>()
+            pin_slab::slot_sizes().take(5).collect::<Vec<_>>()
         );
 
         Ok(())
@@ -332,7 +352,7 @@ mod tests {
     #[test]
     fn calculate_key_invalid() -> Result<()> {
         let invalid_key: usize = 1usize << (mem::size_of::<usize>() * 8 - 1);
-        super::calculate_key(invalid_key);
+        calculate_key(invalid_key);
 
         Ok(())
     }
@@ -341,14 +361,14 @@ mod tests {
     fn calculate_key_valid() -> Result<()> {
         // NB: range of the first slot.
         let expected_key: (usize, usize, usize) = (0, 0, 16);
-        let returned_key: (usize, usize, usize) = match super::calculate_key(0) {
+        let returned_key: (usize, usize, usize) = match calculate_key(0) {
             Some(key) => key,
             None => anyhow::bail!("calculate_key() failed"),
         };
         crate::ensure_eq!(returned_key, expected_key);
 
         let expected_key: (usize, usize, usize) = (0, 15, 16);
-        let returned_key: (usize, usize, usize) = match super::calculate_key(15) {
+        let returned_key: (usize, usize, usize) = match calculate_key(15) {
             Some(key) => key,
             None => anyhow::bail!("calculate_key() failed"),
         };
@@ -357,14 +377,14 @@ mod tests {
         for i in 4..=62 {
             let end_range: usize = 1usize << i;
             let expected_key: (usize, usize, usize) = (i - 3, 0, end_range);
-            let returned_key: (usize, usize, usize) = match super::calculate_key(end_range) {
+            let returned_key: (usize, usize, usize) = match calculate_key(end_range) {
                 Some(key) => key,
                 None => anyhow::bail!("calculate_key() failed"),
             };
             crate::ensure_eq!(returned_key, expected_key);
 
             let expected_key: (usize, usize, usize) = (i - 3, end_range - 1, end_range);
-            let returned_key: (usize, usize, usize) = match super::calculate_key((1usize << (i + 1)) - 1) {
+            let returned_key: (usize, usize, usize) = match calculate_key((1usize << (i + 1)) - 1) {
                 Some(key) => key,
                 None => anyhow::bail!("calculate_key() failed"),
             };
@@ -376,7 +396,7 @@ mod tests {
 
     #[test]
     fn insert_get_remove_many() -> Result<()> {
-        let mut slab: super::PinSlab<Box<u128>> = super::PinSlab::new();
+        let mut slab: PinSlab<Box<u128>> = PinSlab::new();
         let mut keys: Vec<(u128, usize)> = Vec::new();
 
         for i in 0..1024 {
@@ -408,7 +428,7 @@ mod tests {
 
     #[test]
     fn remove_unpin() -> Result<()> {
-        let mut slab: super::PinSlab<i32> = super::PinSlab::new();
+        let mut slab: PinSlab<i32> = PinSlab::new();
         let key: usize = match slab.insert(1) {
             Some(key) => key,
             None => anyhow::bail!("insert() failed"),

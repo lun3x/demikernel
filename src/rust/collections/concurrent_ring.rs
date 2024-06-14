@@ -29,7 +29,6 @@ use ::std::{
     ptr::copy,
 };
 
-#[cfg(feature = "profiler")]
 use crate::timer;
 
 //======================================================================================================================
@@ -87,7 +86,6 @@ impl ConcurrentRingBuffer {
     /// Creates a ring buffer.
     #[allow(unused)]
     pub fn new(capacity: usize) -> Result<Self, Fail> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::new");
         // Check if capacity is invalid.
         if capacity == 0 {
@@ -118,28 +116,26 @@ impl ConcurrentRingBuffer {
     /// Returns the effective capacity of the target ring buffer in bytes.
     #[allow(unused)]
     pub fn capacity(&self) -> usize {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::capacity");
         self.buffer.capacity()
     }
 
     #[allow(unused)]
     pub fn remaining_capacity(&self) -> usize {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::remaining_capacity");
         let push_offset: usize = peek(self.push_offset);
         let pop_offset: usize = peek(self.pop_offset);
-        //println!("{:?} {:?}", push_offset, pop_offset);
         self.available_space(push_offset, pop_offset)
     }
 
     /// Attempts to insert a buffer of [len] bytes into the ring buffer.
     pub fn try_push(&self, buf: &[u8]) -> Result<usize, Fail> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::try_push");
         let len: usize = buf.len();
-        if len == 0 {
-            return Err(Fail::new(libc::EINVAL, "Buffer must be non-zero length"));
+        if (len == 0) || (len >= (1 << (8 * HEADER_SIZE))) {
+            let cause: String = format!("invalid buffer length (len={})", len);
+            error!("try_push(): {}", &cause);
+            return Err(Fail::new(libc::EINVAL, &cause));
         }
         // reserve_space will allocate space for the header.
         if let Some(push_offset) = self.reserve_space(len) {
@@ -168,23 +164,18 @@ impl ConcurrentRingBuffer {
             // 0. The header describes just the length of the payload.
             let old: usize = self.write_header(push_offset, len);
             debug_assert_eq!(old, 0);
-            trace!(
-                "try_push() len={:?} push_offset={:?} pop_offset={:?}",
-                len,
-                peek(self.push_offset),
-                peek(self.pop_offset)
-            );
 
             Ok(len)
         } else {
-            Err(Fail::new(libc::EAGAIN, "No space in the ring buffer"))
+            let cause: String = format!("no space in the ring buffer (len={})", len);
+            error!("try_push(): {}", &cause);
+            Err(Fail::new(libc::EAGAIN, &cause))
         }
     }
 
     /// Inserts an item at the enqueue of the target ring buffer. This function may block (spin).
     #[allow(unused)]
     pub fn push(&self, buf: &[u8]) -> Option<usize> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::push");
         loop {
             match self.try_push(buf) {
@@ -198,10 +189,9 @@ impl ConcurrentRingBuffer {
     /// Attempts to remove next message from the ring buffer up to [len] bytes and copies into [buf]. This function
     /// does not block.
     pub fn try_pop(&self, buf: &mut [u8]) -> Result<usize, Fail> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::try_pop");
-        let len: usize = buf.len();
-        if len == 0 {
+        let buf_len: usize = buf.len();
+        if buf_len == 0 {
             return Err(Fail::new(libc::EINVAL, "Buffer must be non-zero length"));
         }
 
@@ -210,7 +200,7 @@ impl ConcurrentRingBuffer {
         // This represents the total length of the incoming message.
         let pop_len: usize = match self.write_header(pop_offset, 0) {
             0 => return Err(Fail::new(libc::EAGAIN, "No messages in the ring buffer")),
-            bytes if bytes <= len => bytes,
+            bytes if bytes <= buf_len => bytes,
             bytes => {
                 // Buffer is not big enough so put the message back in the queue.
                 // We know that the pop_offset did not move because it was not pointing at a valid message.
@@ -225,30 +215,25 @@ impl ConcurrentRingBuffer {
         let first_len: usize = if pop_offset + pop_len + HEADER_SIZE > self.capacity() {
             self.capacity() - first_offset
         } else {
-            len
+            pop_len
         };
         let buf_ptr: *mut u8 = buf.as_mut_ptr();
         let ring_ptr: *const u8 = unsafe { self.buffer.get().as_ptr() };
         // Copy the data into the ring buffer.
+        debug_assert!(first_len <= pop_len);
         unsafe {
             copy(ring_ptr.add(first_offset), buf_ptr, first_len);
         }
         // If there is remaining data in the buffer, wrap around.
-        if len > first_len {
+        if pop_len > first_len {
             // Copy the data into the ring buffer.
             unsafe {
-                copy(ring_ptr, buf_ptr.add(first_len), len - first_len);
+                copy(ring_ptr, buf_ptr.add(first_len), pop_len - first_len);
             }
         }
 
         // Move to next buffer.
         self.release_space(pop_offset, pop_len);
-        trace!(
-            "try_push() len={:?} push_offset={:?} pop_offset={:?}",
-            len,
-            peek(self.push_offset),
-            peek(self.pop_offset)
-        );
         Ok(pop_len)
     }
 
@@ -256,7 +241,6 @@ impl ConcurrentRingBuffer {
     /// (spin).
     #[allow(unused)]
     pub fn pop(&self, buf: &mut [u8]) -> Option<usize> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::pop");
         loop {
             match self.try_pop(buf) {
@@ -269,19 +253,17 @@ impl ConcurrentRingBuffer {
 
     /// Atomically writes a header at the indicated offset and returns the previous one.
     fn write_header(&self, offset: usize, val: usize) -> usize {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::write_header");
         assert!(offset % 2 == 0);
         let buffer_ptr: *mut u8 = unsafe { self.buffer.get_mut() }.as_mut_ptr();
         let header_ptr: *mut u16 = unsafe { buffer_ptr.add(offset) } as *mut u16;
-        let header: &AtomicU16 = AtomicU16::from_mut(unsafe { &mut *header_ptr });
+        let header: &AtomicU16 = unsafe { &*header_ptr.cast() };
         header.swap(val as u16, atomic::Ordering::Relaxed) as usize
     }
 
     /// Given a [push_offset] and [pop_offset] into the ring buffer, return available space for writing data. Always
     /// leave one [HEADER_SIZE] space for distinguishing a full from empty buffer.
     fn available_space(&self, push_offset: usize, pop_offset: usize) -> usize {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::available_space");
         debug_assert!(push_offset + self.capacity() > pop_offset);
         let used_space: usize = (push_offset + self.capacity() - pop_offset) % self.capacity();
@@ -292,7 +274,6 @@ impl ConcurrentRingBuffer {
     /// Reserves [len] + HEADER_SIZE bytes from the ring buffer. If successful, returns the offset of the beginning of
     /// the buffer, else returns `None`.
     fn reserve_space(&self, len: usize) -> Option<usize> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::reserve_space");
         let len_: usize = align_header(len + HEADER_SIZE);
         let push_offset: usize = peek(self.push_offset);
@@ -316,7 +297,6 @@ impl ConcurrentRingBuffer {
 
     /// Frees [len] + HEADER_SIZE bytes from the ring buffer.
     fn release_space(&self, current_offset: usize, len: usize) {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::release_space");
         let len_: usize = align_header(len + HEADER_SIZE);
         let new_offset: usize = (current_offset + len_) % self.capacity();
@@ -324,30 +304,22 @@ impl ConcurrentRingBuffer {
         check_and_set(self.pop_offset, current_offset, new_offset).unwrap();
     }
 
-    #[allow(unused)]
-    pub fn is_full(&self) -> bool {
-        #[cfg(feature = "profiler")]
-        timer!("collections::concurrent_ring::is_full");
-        let push_offset = peek(self.push_offset);
-        let pop_offset = peek(self.pop_offset);
-
-        self.available_space(push_offset, pop_offset) == 0
+    /// Peeks the target ring buffer and checks if it is full.
+    #[cfg(test)]
+    fn is_full(&self) -> bool {
+        self.remaining_capacity() == HEADER_SIZE
     }
 
     /// Peeks the target ring buffer and checks if it is empty.
-    #[allow(unused)]
-    pub fn is_empty(&self) -> bool {
-        #[cfg(feature = "profiler")]
-        timer!("collections::concurrent_ring::is_empty");
-        let push_offset = peek(self.push_offset);
-        let pop_offset = peek(self.pop_offset);
-
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        let push_offset: usize = peek(self.push_offset);
+        let pop_offset: usize = peek(self.pop_offset);
         pop_offset == push_offset
     }
 
     /// Allocates a memory area.
     fn alloc<T>() -> Result<*mut T, Fail> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::alloc");
         let layout: Layout = Layout::new::<T>();
         let ptr: *mut T = unsafe { alloc::alloc(layout) as *mut T };
@@ -366,7 +338,6 @@ impl Ring for ConcurrentRingBuffer {
     /// the amount of storage space in bytes that should be available. [size] must be at least large enough to hold
     /// capacity, plus the push and pop offsets and a [HEADER_SIZE] piece of padding.
     fn from_raw_parts(init: bool, ptr: *mut u8, capacity: usize) -> Result<Self, Fail> {
-        #[cfg(feature = "profiler")]
         timer!("collections::concurrent_ring::from_raw_parts");
         // Check if we have a valid pointer.
         if ptr.is_null() {
@@ -427,14 +398,14 @@ impl Ring for ConcurrentRingBuffer {
 
 /// Peeks at the value at [ptr] to check various constraints.
 fn peek(ptr: *mut usize) -> usize {
-    let ptr: &mut AtomicUsize = AtomicUsize::from_mut(unsafe { &mut *ptr });
+    let ptr: &AtomicUsize = unsafe { &*ptr.cast() };
     ptr.load(atomic::Ordering::Relaxed)
 }
 
 /// Compares and increments the value at [ptr] only if it has not changed since the last time we read it.
 fn check_and_set(ptr: *mut usize, current: usize, new: usize) -> Result<usize, usize> {
-    let ptr_: &mut AtomicUsize = AtomicUsize::from_mut(unsafe { &mut *ptr });
-    ptr_.compare_exchange_weak(current, new, atomic::Ordering::Acquire, atomic::Ordering::Relaxed)
+    let ptr: &AtomicUsize = unsafe { &*ptr.cast() };
+    ptr.compare_exchange_weak(current, new, atomic::Ordering::Acquire, atomic::Ordering::Relaxed)
 }
 
 /// Align to [HEADER_SIZE] for the header offset.
@@ -478,9 +449,10 @@ impl Drop for ConcurrentRingBuffer {
 
 #[cfg(test)]
 mod test {
-    use super::{
+    use crate::collections::concurrent_ring::{
         ConcurrentRingBuffer,
         Ring,
+        HEADER_SIZE,
     };
     use ::anyhow::Result;
     use ::core::mem;
@@ -528,6 +500,58 @@ mod test {
         Ok(ring)
     }
 
+    /// Pushes data to a ring buffer until it is full.
+    fn full_ring_buffer() -> Result<ConcurrentRingBuffer> {
+        let mut npushes: usize = 0;
+        let byte: [u8; 1] = [0xff];
+        let ring: ConcurrentRingBuffer = do_new()?;
+        while ring.remaining_capacity() > HEADER_SIZE {
+            do_success_push_bytes(&ring, &byte)?;
+            npushes += 1;
+        }
+
+        // Check if we got the expected number of pushes.
+        crate::ensure_eq!(npushes, ring.capacity() / (2 * HEADER_SIZE) - 1);
+
+        // Check if ring is full.
+        crate::ensure_eq!(ring.is_full(), true);
+
+        // Fail to push a byte.
+        if ring.try_push(&byte).is_ok() {
+            anyhow::bail!("Should not be able to push");
+        }
+
+        Ok(ring)
+    }
+
+    /// Empty ring buffer.
+    fn empty_ring_buffer(ring: &ConcurrentRingBuffer) -> Result<()> {
+        let mut npops: usize = 0;
+        while !ring.is_empty() {
+            let mut buf: [u8; 1] = [0; 1];
+            if let Ok(len) = ring.try_pop(&mut buf) {
+                crate::ensure_eq!(len, 1);
+                npops += 1;
+            } else {
+                anyhow::bail!("Should be able to pop");
+            }
+        }
+
+        // Check if we got the expected number of pops.
+        crate::ensure_eq!(npops, ring.capacity() / (2 * HEADER_SIZE) - 1);
+
+        // Check if ring is empty.
+        crate::ensure_eq!(ring.is_empty(), true);
+
+        // Fail to pop a byte.
+        let mut buf: [u8; 1] = [0; 1];
+        if ring.try_pop(&mut buf).is_ok() {
+            anyhow::bail!("Should not be able to pop");
+        }
+
+        Ok(())
+    }
+
     /// Sequentially enqueues and dequeues elements to/from a ring buffer.
     fn do_enqueue_dequeue(ring: &mut ConcurrentRingBuffer) -> Result<()> {
         // Insert items in the ring buffer.
@@ -549,7 +573,7 @@ mod test {
             };
         }
 
-        println!("inserted {:?} elements", elements);
+        trace!("inserted {:?} elements", elements);
         // Check if buffer state is consistent.
         crate::ensure_eq!(ring.is_empty(), false);
 
@@ -585,6 +609,142 @@ mod test {
         let mut array: [u8; SIZE] = [0; SIZE];
         do_from_raw(array.as_mut_ptr() as *mut u8, SIZE)?;
         Ok(())
+    }
+
+    #[test]
+    fn try_push_invalid() -> Result<()> {
+        let ring: ConcurrentRingBuffer = do_new()?;
+
+        // Fail to push zero bytes.
+        let zero_bytes: [u8; 0] = [];
+        do_fail_push_bytes(&ring, &zero_bytes)?;
+
+        // Fail to push beyond maximum number of bytes.
+        const MAX_BYTES: usize = (1 << (HEADER_SIZE * 8)) - 1;
+        let max_bytes: [u8; MAX_BYTES] = [0xff; MAX_BYTES];
+        do_fail_push_bytes(&ring, &max_bytes)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_pop_invalid() -> Result<()> {
+        let ring: ConcurrentRingBuffer = do_new()?;
+
+        // Fail to pop zero bytes.
+        let mut zero_bytes: [u8; 0] = [];
+        do_fail_pop_bytes(&ring, &mut zero_bytes)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_push_until_full() -> Result<()> {
+        full_ring_buffer()?;
+        Ok(())
+    }
+
+    #[test]
+    fn try_push_until_wrap_around() -> Result<()> {
+        let ring: ConcurrentRingBuffer = full_ring_buffer()?;
+
+        // Pop a single byte.
+        const BUF_LEN: usize = 1;
+        let mut buf: [u8; BUF_LEN] = [0; BUF_LEN];
+        do_success_pop_bytes(&ring, &mut buf, BUF_LEN)?;
+
+        // Fail to push eight bytes.
+        let eight_bytes: [u8; 8] = [0xff; 8];
+        do_fail_push_bytes(&ring, &eight_bytes)?;
+
+        // Succeed to push two bytes.
+        let mut two_bytes: [u8; 2] = [0xff; 2];
+        do_success_push_bytes(&ring, &two_bytes)?;
+
+        // Check if ring is full.
+        crate::ensure_eq!(ring.is_full(), true);
+
+        // Fail to push two bytes.
+        do_fail_push_bytes(&ring, &mut two_bytes)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_pop_until_empty() -> Result<()> {
+        let ring: ConcurrentRingBuffer = full_ring_buffer()?;
+        empty_ring_buffer(&ring)?;
+        Ok(())
+    }
+
+    #[test]
+    fn try_pop_until_wrap_around() -> Result<()> {
+        let ring: ConcurrentRingBuffer = full_ring_buffer()?;
+
+        empty_ring_buffer(&ring)?;
+
+        // Succeed to push four bytes.
+        let four_bytes: [u8; 4] = [0xff; 4];
+        do_success_push_bytes(&ring, &four_bytes)?;
+
+        // Pop eight bytes.
+        let mut eight_bytes: [u8; 8] = [0; 8];
+        do_success_pop_bytes(&ring, &mut eight_bytes, four_bytes.len())?;
+
+        // Fail to pop a byte.
+        let mut buf: [u8; 1] = [0; 1];
+        do_fail_pop_bytes(&ring, &mut buf)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_pop_irregular() -> Result<()> {
+        let ring: ConcurrentRingBuffer = do_new()?;
+
+        // Push four bytes.
+        let four_bytes: [u8; 4] = [0xff; 4];
+        do_success_push_bytes(&ring, &four_bytes)?;
+
+        // Attempt to pop eight bytes, but get four.
+        let mut eight_bytes: [u8; 8] = [0; 8];
+        do_success_pop_bytes(&ring, &mut eight_bytes, four_bytes.len())?;
+
+        Ok(())
+    }
+
+    fn do_success_push_bytes(ring: &ConcurrentRingBuffer, buf: &[u8]) -> Result<()> {
+        if let Ok(len) = ring.try_push(buf) {
+            crate::ensure_eq!(len, buf.len());
+            Ok(())
+        } else {
+            anyhow::bail!("Should be able to push {} bytes", buf.len())
+        }
+    }
+
+    fn do_fail_push_bytes(ring: &ConcurrentRingBuffer, buf: &[u8]) -> Result<()> {
+        if ring.try_push(buf).is_ok() {
+            anyhow::bail!("Should not be able to push {} bytes", buf.len())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn do_success_pop_bytes(ring: &ConcurrentRingBuffer, buf: &mut [u8], expected_len: usize) -> Result<()> {
+        if let Ok(len) = ring.try_pop(buf) {
+            crate::ensure_eq!(len, expected_len);
+            Ok(())
+        } else {
+            anyhow::bail!("Should be able to pop")
+        }
+    }
+
+    fn do_fail_pop_bytes(ring: &ConcurrentRingBuffer, buf: &mut [u8]) -> Result<()> {
+        if ring.try_pop(buf).is_ok() {
+            anyhow::bail!("Should not be able to pop")
+        } else {
+            Ok(())
+        }
     }
 
     /// Tets if we succeed to sequentially enqueue and dequeue elements to/from a ring buffer.
@@ -663,7 +823,7 @@ mod test {
             (seqnum, tid)
         }
 
-        println!(
+        trace!(
             "starting {} writers and {} readers",
             NUMBER_OF_THREADS / 2,
             NUMBER_OF_THREADS / 2
@@ -683,7 +843,7 @@ mod test {
                         let self_tid: u8 = thread::current().name().unwrap().parse::<u8>().unwrap();
                         let peer_tid: u8 = self_tid + 1;
 
-                        println!("writer: started");
+                        trace!("writer: started");
                         while seqnum <= NUMBER_OF_ITERATIONS {
                             // Cook message.
                             cook_message(&mut buf[..], seqnum, peer_tid);
@@ -692,9 +852,11 @@ mod test {
                                 // Push message.
                                 push_message(&writer_ring, &buf[..]);
 
-                                println!(
+                                trace!(
                                     "writer: sent (seqnum={:?}/{:?}, tid={:?})",
-                                    seqnum, NUMBER_OF_ITERATIONS, peer_tid
+                                    seqnum,
+                                    NUMBER_OF_ITERATIONS,
+                                    peer_tid
                                 );
 
                                 // Pop message.
@@ -706,17 +868,17 @@ mod test {
                                 // Extract peer ID and sequence number.
                                 let (recv_seqnum, recv_tid): (u8, u8) = parse_message(&buf[..]);
 
-                                println!("writer: ack received (seqnum={:?}, tid={})", recv_seqnum, recv_tid);
+                                trace!("writer: ack received (seqnum={:?}, tid={})", recv_seqnum, recv_tid);
 
                                 // Check whether or not this thread is the intended recipient for this message.
                                 if recv_tid != self_tid {
-                                    println!("writer: dropping message (seqnum={}, bad recipient)", recv_seqnum);
+                                    trace!("writer: dropping message (seqnum={}, bad recipient)", recv_seqnum);
                                     continue;
                                 }
 
                                 // Check whether or not if sequence number matches what we expect.
                                 if recv_seqnum != seqnum {
-                                    println!("writer: dropping message (seqnum={}, malformed)", seqnum);
+                                    trace!("writer: dropping message (seqnum={}, malformed)", seqnum);
                                     continue;
                                 }
 
@@ -731,7 +893,7 @@ mod test {
 
                             seqnum = seqnum + 1;
                         }
-                        println!("writer: done");
+                        trace!("writer: done");
                     })
                     .unwrap();
 
@@ -744,7 +906,7 @@ mod test {
                         let self_tid: u8 = thread::current().name().unwrap().parse::<u8>().unwrap();
                         let peer_tid: u8 = self_tid - 1;
 
-                        println!("reader: started");
+                        trace!("reader: started");
                         while next_seqnum <= NUMBER_OF_ITERATIONS {
                             // Pop message.
                             if pop_message_timeout(&writer_ring, &mut buf[..]).is_err() {
@@ -755,23 +917,23 @@ mod test {
                             // Extract peer ID and sequence number.
                             let (recv_seqnum, recv_tid): (u8, u8) = parse_message(&buf[..]);
 
-                            println!("reader: received (seqnum={}, tid={})", recv_seqnum, recv_tid);
+                            trace!("reader: received (seqnum={}, tid={})", recv_seqnum, recv_tid);
 
                             // Check whether or not this thread is the intended recipient for this message.
                             if recv_tid != self_tid {
-                                println!("reader: dropping message (seqnum={}, bad recipient)", recv_seqnum);
+                                trace!("reader: dropping message (seqnum={}, bad recipient)", recv_seqnum);
                                 continue;
                             }
 
                             // Check whether or not we received an old message.
                             if recv_seqnum < next_seqnum {
-                                println!("reader: dropping message (seqnum={}, old message)", recv_seqnum);
+                                trace!("reader: dropping message (seqnum={}, old message)", recv_seqnum);
                                 continue;
                             }
 
                             // Check whether or not we received a malformed message.
                             if check_message(&buf).is_err() {
-                                println!("reader: dropping message (seqnum={}, malformed)", recv_seqnum);
+                                trace!("reader: dropping message (seqnum={}, malformed)", recv_seqnum);
                                 continue;
                             }
 
@@ -786,7 +948,7 @@ mod test {
                             // Push message.
                             push_message(&reader_ring, &buf);
 
-                            println!("reader: ack (seqnum={}, tid={})", next_seqnum, recv_tid);
+                            trace!("reader: ack (seqnum={}, tid={})", next_seqnum, recv_tid);
                         }
                     })
                     .unwrap();

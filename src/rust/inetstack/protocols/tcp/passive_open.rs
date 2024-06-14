@@ -6,7 +6,14 @@
 //======================================================================================================================
 
 use crate::{
-    collections::async_queue::AsyncQueue,
+    collections::{
+        async_queue::{
+            AsyncQueue,
+            SharedAsyncQueue,
+        },
+        async_value::SharedAsyncValue,
+    },
+    expect_some,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ethernet2::{
@@ -18,8 +25,10 @@ use crate::{
         tcp::{
             constants::FALLBACK_MSS,
             established::{
-                congestion_control,
-                congestion_control::CongestionControl,
+                congestion_control::{
+                    self,
+                    CongestionControl,
+                },
                 EstablishedSocket,
             },
             isn_generator::IsnGenerator,
@@ -32,34 +41,32 @@ use crate::{
         },
     },
     runtime::{
+        conditional_yield_with_timeout,
         fail::Fail,
         memory::DemiBuffer,
         network::{
             config::TcpConfig,
+            consts::MAX_WINDOW_SCALE,
+            socket::option::TcpSocketOptions,
             types::MacAddress,
             NetworkRuntime,
         },
-        scheduler::{
-            TaskHandle,
-            Yielder,
-            YielderHandle,
-        },
-        timer::SharedTimer,
         QDesc,
-        SharedBox,
         SharedDemiRuntime,
         SharedObject,
     },
+    QToken,
 };
-use ::core::panic;
-use ::futures::channel::mpsc;
+use ::futures::{
+    channel::mpsc,
+    FutureExt,
+};
 use ::libc::{
     EBADMSG,
     ETIMEDOUT,
 };
 use ::std::{
     collections::HashMap,
-    convert::TryInto,
     net::SocketAddrV4,
     ops::{
         Deref,
@@ -72,62 +79,81 @@ use ::std::{
 // Structures
 //======================================================================================================================
 
-struct InflightAccept {
-    local_isn: SeqNumber,
-    remote_isn: SeqNumber,
-    header_window_size: u16,
-    remote_window_scale: Option<u8>,
-    mss: usize,
-    handle: TaskHandle,
-    yielder_handle: YielderHandle,
+/// States of a passive socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// The socket is listening for new connections.
+    Listening,
+    /// The socket is closed.
+    Closed,
 }
 
-pub struct PassiveSocket<const N: usize> {
-    inflight: HashMap<SocketAddrV4, InflightAccept>,
+pub struct PassiveSocket<N: NetworkRuntime> {
+    // TCP Connection State.
+    state: SharedAsyncValue<State>,
+    connections: HashMap<SocketAddrV4, SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>>,
+    recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>,
     ready: AsyncQueue<Result<EstablishedSocket<N>, Fail>>,
     max_backlog: usize,
     isn_generator: IsnGenerator,
     local: SocketAddrV4,
     runtime: SharedDemiRuntime,
-    transport: SharedBox<dyn NetworkRuntime<N>>,
+    transport: N,
     tcp_config: TcpConfig,
+    // We do not use these right now, but will in the future.
+    socket_options: TcpSocketOptions,
     local_link_addr: MacAddress,
     arp: SharedArpPeer<N>,
     dead_socket_tx: mpsc::UnboundedSender<QDesc>,
+
+    background_task_qt: Option<QToken>,
+    socket_queue: SharedAsyncQueue<SocketAddrV4>,
 }
 
 #[derive(Clone)]
-pub struct SharedPassiveSocket<const N: usize>(SharedObject<PassiveSocket<N>>);
+pub struct SharedPassiveSocket<N: NetworkRuntime>(SharedObject<PassiveSocket<N>>);
 
 //======================================================================================================================
 // Associated Function
 //======================================================================================================================
 
-impl<const N: usize> SharedPassiveSocket<N> {
+impl<N: NetworkRuntime> SharedPassiveSocket<N> {
     pub fn new(
         local: SocketAddrV4,
         max_backlog: usize,
-        runtime: SharedDemiRuntime,
-        transport: SharedBox<dyn NetworkRuntime<N>>,
+        mut runtime: SharedDemiRuntime,
+        recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>,
+        transport: N,
         tcp_config: TcpConfig,
+        default_socket_options: TcpSocketOptions,
         local_link_addr: MacAddress,
         arp: SharedArpPeer<N>,
         dead_socket_tx: mpsc::UnboundedSender<QDesc>,
         nonce: u32,
-    ) -> Self {
-        Self(SharedObject::<PassiveSocket<N>>::new(PassiveSocket::<N> {
-            inflight: HashMap::new(),
+    ) -> Result<Self, Fail> {
+        let socket_queue: SharedAsyncQueue<SocketAddrV4> = SharedAsyncQueue::<SocketAddrV4>::default();
+        let mut me: Self = Self(SharedObject::<PassiveSocket<N>>::new(PassiveSocket {
+            state: SharedAsyncValue::new(State::Listening),
+            connections: HashMap::<SocketAddrV4, SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>>::new(),
+            recv_queue,
             ready: AsyncQueue::<Result<EstablishedSocket<N>, Fail>>::default(),
             max_backlog,
             isn_generator: IsnGenerator::new(nonce),
             local,
             local_link_addr,
-            runtime,
+            runtime: runtime.clone(),
             transport,
             tcp_config,
+            socket_options: default_socket_options,
             arp,
             dead_socket_tx,
-        }))
+            background_task_qt: None,
+            socket_queue,
+        }));
+        let qt: QToken =
+            runtime.insert_background_coroutine("passive_listening::poll", Box::pin(me.clone().poll().fuse()))?;
+        me.background_task_qt = Some(qt);
+        Ok(me)
     }
 
     /// Returns the address that the socket is bound to.
@@ -136,48 +162,79 @@ impl<const N: usize> SharedPassiveSocket<N> {
     }
 
     /// Accept a new connection by fetching one from the queue of requests, blocking if there are no new requests.
-    pub async fn do_accept(&mut self, yielder: Yielder) -> Result<EstablishedSocket<N>, Fail> {
-        self.ready.pop(&yielder).await?
+    pub async fn do_accept(&mut self) -> Result<EstablishedSocket<N>, Fail> {
+        self.ready.pop(None).await?
     }
 
-    /// Receive and direct new connection requests and ACKs.
-    pub fn receive(&mut self, ip_header: &Ipv4Header, header: TcpHeader, buf: DemiBuffer) -> Result<(), Fail> {
-        let remote = SocketAddrV4::new(ip_header.get_src_addr(), header.src_port);
-        // If the packet is for an inflight connection, route it there.
-        if let Some(inflight) = self.inflight.remove(&remote) {
-            // If ack for inflight connection request, remove from inflight table and handle. If error, we do not put
-            // the inflight request back but drop it.
-            // FIXME: https://github.com/microsoft/demikernel/issues/1054
-            if header.ack {
-                return self.handle_ack(inflight, remote, header, buf);
-            } else {
-                return Err(Fail::new(EBADMSG, "expecting ACK"));
-            }
-        } else {
-            // Check whether this packet is for a connection that we have finished accepting.
-            for result in self.ready.get_mut_values() {
-                match result {
-                    // We've finished establishing the connection, so just deliver the packet.
-                    Ok(ref mut socket) if socket.endpoints().1 == remote => {
-                        socket.receive(header, buf);
-                        return Ok(());
+    // Closes the target socket.
+    pub fn close(&mut self) -> Result<(), Fail> {
+        self.state.set(State::Closed);
+        Ok(())
+    }
+
+    async fn poll(mut self) {
+        loop {
+            let mut socket_queue: SharedAsyncQueue<SocketAddrV4> = self.socket_queue.clone();
+            let mut recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)> = self.recv_queue.clone();
+            let mut state: SharedAsyncValue<State> = self.state.clone();
+            // Remove sockets that have been closed.
+            futures::select! {
+                res = socket_queue.pop(None).fuse() => match res {
+                    Ok(socket) => match self.connections.remove(&socket) {
+                        Some(_recv_queue) => {},
+                        None => unreachable!("poll(): should have a matching connection"),
                     },
-                    _ => continue,
+                    Err(_) => continue,
+                },
+                result = recv_queue.pop(None).fuse() => {
+                    match result {
+                        Ok((ipv4_hdr, tcp_hdr, buf)) =>  {
+                                    let remote: SocketAddrV4 = SocketAddrV4::new(ipv4_hdr.get_src_addr(), tcp_hdr.src_port);
+                                    if let Some(recv_queue) = self.connections.get_mut(&remote) {
+                                        // Packet is either for an inflight request or established connection.
+                                        recv_queue.push((ipv4_hdr, tcp_hdr, buf));
+                                        continue;
+                                    }
+
+                                    // If not a SYN, then this packet is not for a new connection and we throw it away.
+                                    if !tcp_hdr.syn || tcp_hdr.ack || tcp_hdr.rst {
+                                        let cause: String = format!(
+                                            "invalid TCP flags (syn={}, ack={}, rst={})",
+                                            tcp_hdr.syn, tcp_hdr.ack, tcp_hdr.rst
+                                        );
+                                        warn!("poll(): {}", cause);
+                                        self.send_rst(&remote, tcp_hdr);
+                                        continue;
+                                    }
+
+                                    // Check if this SYN segment carries any data.
+                                    if !buf.is_empty() {
+                                        // RFC 793 allows connections to be established with data-carrying segments, but we do not support this.
+                                        // We simply drop the data and and proceed with the three-way handshake protocol, on the hope that the
+                                        // remote will retransmit the data after the connection is established.
+                                        // See: https://datatracker.ietf.org/doc/html/rfc793#section-3.4 fo more details.
+                                        warn!("Received SYN with data (len={})", buf.len());
+                                        // TODO: https://github.com/microsoft/demikernel/issues/1115
+                                    }
+
+                                    // Start a new connection.
+                                    self.handle_new_syn(remote, tcp_hdr);
+                        }
+                        Err(_) => continue,
+                    }
+                },
+                result = state.wait_for_change(None).fuse() => {
+                    if let Ok(result) = result {
+                        if result == State::Closed {return;}
+                    }
                 }
             }
         }
-
-        // If not a SYN, then this packet is not for a new connection and we throw it away.
-        if !header.syn || header.ack || header.rst {
-            return Err(Fail::new(EBADMSG, "invalid flags"));
-        }
-        // Start a new connection.
-        self.handle_syn(remote, header)
     }
 
-    fn handle_syn(&mut self, remote: SocketAddrV4, header: TcpHeader) -> Result<(), Fail> {
-        debug!("Received SYN: {:?}", header);
-        let inflight_len: usize = self.inflight.len();
+    fn handle_new_syn(&mut self, remote: SocketAddrV4, tcp_hdr: TcpHeader) {
+        debug!("Received SYN: {:?}", tcp_hdr);
+        let inflight_len: usize = self.connections.len();
         if inflight_len + self.ready.len() >= self.max_backlog {
             let cause: String = format!(
                 "backlog full (inflight={}, ready={}, backlog={})",
@@ -185,27 +242,107 @@ impl<const N: usize> SharedPassiveSocket<N> {
                 self.ready.len(),
                 self.max_backlog
             );
-            error!("receive(): {:?}", &cause);
-            return Err(Fail::new(libc::ECONNREFUSED, &cause));
+            warn!("handle_new_syn(): {}", cause);
+            self.send_rst(&remote, tcp_hdr);
+            return;
         }
 
         // Send SYN+ACK.
         let local: SocketAddrV4 = self.local.clone();
         let local_isn = self.isn_generator.generate(&local, &remote);
-        let remote_isn = header.seq_num;
+        let remote_isn = tcp_hdr.seq_num;
 
         // Allocate a new coroutine to send the SYN+ACK and retry if necessary.
-        let yielder: Yielder = Yielder::new();
-        let yielder_handle: YielderHandle = yielder.get_handle();
-        let future = self.clone().send_syn_ack(remote, remote_isn, local_isn, yielder);
-        let handle: TaskHandle = self
+        let recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)> =
+            SharedAsyncQueue::<(Ipv4Header, TcpHeader, DemiBuffer)>::default();
+        let ack_queue: SharedAsyncQueue<usize> = SharedAsyncQueue::<usize>::default();
+        let future = self
+            .clone()
+            .send_syn_ack_and_wait_for_ack(remote, remote_isn, local_isn, tcp_hdr, recv_queue.clone(), ack_queue)
+            .fuse();
+        match self
             .runtime
-            .insert_background_coroutine("Inetstack::TCP::passiveopen::background", Box::pin(future))?;
+            .insert_background_coroutine("Inetstack::TCP::passiveopen::background", Box::pin(future))
+        {
+            Ok(qt) => qt,
+            Err(e) => {
+                let cause = "Could not allocate coroutine for passive open";
+                error!("{}: {:?}", cause, e);
+                return;
+            },
+        };
+        // TODO: Clean up the connections table once we have merged all of the routing tables into one.
+        self.connections.insert(remote, recv_queue);
+    }
 
+    /// Sends a RST segment to `remote`.
+    fn send_rst(&mut self, remote: &SocketAddrV4, tcp_hdr: TcpHeader) {
+        debug!("send_rst(): sending RST to {:?}", remote);
+
+        // If this is an inactive socket, then generate a RST segment.
+        // Generate the RST segment according to the ACK field.
+        // If the incoming segment has an ACK field, the reset takes its
+        // sequence number from the ACK field of the segment, otherwise the
+        // reset has sequence number zero and the ACK field is set to the sum
+        // of the sequence number and segment length of the incoming segment.
+        // Reference: https://datatracker.ietf.org/doc/html/rfc793#section-3.4
+        let (seq_num, ack_num): (SeqNumber, Option<SeqNumber>) = if tcp_hdr.ack {
+            (tcp_hdr.ack_num, Some(tcp_hdr.ack_num + SeqNumber::from(1)))
+        } else {
+            (
+                SeqNumber::from(0),
+                Some(tcp_hdr.seq_num + SeqNumber::from(tcp_hdr.compute_size() as u32)),
+            )
+        };
+
+        // Query link address for destination.
+        let dst_link_addr: MacAddress = match self.arp.try_query(remote.ip().clone()) {
+            Some(link_addr) => link_addr,
+            None => {
+                // ARP query is unlikely to fail, but if it does, don't send the RST segment,
+                // and return an error to server side.
+                let cause: String = format!("missing ARP entry (remote={})", remote.ip());
+                error!("send_rst(): {}", &cause);
+                return;
+            },
+        };
+
+        // Create a RST segment.
+        let segment: TcpSegment = {
+            let mut tcp_hdr: TcpHeader = TcpHeader::new(self.local.port(), remote.port());
+            tcp_hdr.rst = true;
+            tcp_hdr.seq_num = seq_num;
+            if let Some(ack_num) = ack_num {
+                tcp_hdr.ack = true;
+                tcp_hdr.ack_num = ack_num;
+            }
+            TcpSegment {
+                ethernet2_hdr: Ethernet2Header::new(dst_link_addr, self.local_link_addr, EtherType2::Ipv4),
+                ipv4_hdr: Ipv4Header::new(self.local.ip().clone(), remote.ip().clone(), IpProtocol::TCP),
+                tcp_hdr,
+                data: None,
+                tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
+            }
+        };
+
+        // Send it.
+        let pkt: Box<TcpSegment> = Box::new(segment);
+        self.transport.transmit(pkt);
+    }
+
+    async fn send_syn_ack_and_wait_for_ack(
+        mut self,
+        remote: SocketAddrV4,
+        remote_isn: SeqNumber,
+        local_isn: SeqNumber,
+        tcp_hdr: TcpHeader,
+        recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>,
+        ack_queue: SharedAsyncQueue<usize>,
+    ) {
         // Set up new inflight accept connection.
         let mut remote_window_scale = None;
         let mut mss = FALLBACK_MSS;
-        for option in header.iter_options() {
+        for option in tcp_hdr.iter_options() {
             match option {
                 TcpOptions2::WindowScale(w) => {
                     info!("Received window scale: {:?}", w);
@@ -218,54 +355,136 @@ impl<const N: usize> SharedPassiveSocket<N> {
                 _ => continue,
             }
         }
-        let accept = InflightAccept {
-            local_isn,
-            remote_isn,
-            header_window_size: header.window_size,
-            remote_window_scale,
-            mss,
-            handle,
-            yielder_handle,
+
+        let mut handshake_retries: usize = self.tcp_config.get_handshake_retries();
+        let handshake_timeout: Duration = self.tcp_config.get_handshake_timeout();
+
+        loop {
+            // Send the SYN + ACK.
+            if let Err(e) = self.send_syn_ack(local_isn, remote_isn, remote).await {
+                self.ready.push(Err(e));
+                return;
+            }
+
+            // Start ack timer.
+
+            // Wait for ACK in response.
+            let ack = self.clone().wait_for_ack(
+                recv_queue.clone(),
+                ack_queue.clone(),
+                remote,
+                local_isn,
+                remote_isn,
+                tcp_hdr.window_size,
+                remote_window_scale,
+                mss,
+            );
+
+            // Either we get an ack or a timeout.
+            match conditional_yield_with_timeout(ack, handshake_timeout).await {
+                // Got an ack
+                Ok(result) => {
+                    self.ready.push(result);
+                    return;
+                },
+                Err(Fail { errno, cause: _ }) if errno == ETIMEDOUT => {
+                    if handshake_retries > 0 {
+                        handshake_retries = handshake_retries - 1;
+                        continue;
+                    } else {
+                        self.ready.push(Err(Fail::new(ETIMEDOUT, "handshake timeout")));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    self.ready.push(Err(e));
+                    return;
+                },
+            }
+        }
+    }
+
+    async fn send_syn_ack(
+        &mut self,
+        local_isn: SeqNumber,
+        remote_isn: SeqNumber,
+        remote: SocketAddrV4,
+    ) -> Result<(), Fail> {
+        let remote_link_addr = self.arp.query(remote.ip().clone()).await?;
+        let mut tcp_hdr = TcpHeader::new(self.local.port(), remote.port());
+        tcp_hdr.syn = true;
+        tcp_hdr.seq_num = local_isn;
+        tcp_hdr.ack = true;
+        tcp_hdr.ack_num = remote_isn + SeqNumber::from(1);
+        tcp_hdr.window_size = self.tcp_config.get_receive_window_size();
+
+        let mss = self.tcp_config.get_advertised_mss() as u16;
+        tcp_hdr.push_option(TcpOptions2::MaximumSegmentSize(mss));
+        info!("Advertising MSS: {}", mss);
+
+        tcp_hdr.push_option(TcpOptions2::WindowScale(self.tcp_config.get_window_scale()));
+        info!("Advertising window scale: {}", self.tcp_config.get_window_scale());
+
+        debug!("Sending SYN+ACK: {:?}", tcp_hdr);
+        let segment = TcpSegment {
+            ethernet2_hdr: Ethernet2Header::new(remote_link_addr, self.local_link_addr, EtherType2::Ipv4),
+            ipv4_hdr: Ipv4Header::new(self.local.ip().clone(), remote.ip().clone(), IpProtocol::TCP),
+            tcp_hdr,
+            data: None,
+            tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
         };
-        self.inflight.insert(remote, accept);
+        self.transport.transmit(Box::new(segment));
         Ok(())
     }
 
-    fn handle_ack(
-        &mut self,
-        mut inflight: InflightAccept,
+    async fn wait_for_ack(
+        self,
+        mut recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>,
+        ack_queue: SharedAsyncQueue<usize>,
         remote: SocketAddrV4,
-        header: TcpHeader,
-        buf: DemiBuffer,
-    ) -> Result<(), Fail> {
-        debug!("Received ACK: {:?}", header);
-        // Grab values from inflight accept.
-        let InflightAccept {
-            local_isn,
-            remote_isn,
-            header_window_size,
-            remote_window_scale,
-            mss,
-            ..
-        } = inflight;
+        local_isn: SeqNumber,
+        remote_isn: SeqNumber,
+        header_window_size: u16,
+        remote_window_scale: Option<u8>,
+        mss: usize,
+    ) -> Result<EstablishedSocket<N>, Fail> {
+        let (ipv4_hdr, tcp_hdr, buf) = recv_queue.pop(None).await?;
+        debug!("Received ACK: {:?}", tcp_hdr);
 
         // Check the ack sequence number.
-        if header.ack_num != local_isn + SeqNumber::from(1) {
+        if tcp_hdr.ack_num != local_isn + SeqNumber::from(1) {
             return Err(Fail::new(EBADMSG, "invalid SYN+ACK seq num"));
         }
 
-        let (local_window_scale, remote_window_scale) = match remote_window_scale {
-            Some(w) => (self.tcp_config.get_window_scale() as u32, w),
+        // Calculate the window.
+        let (local_window_scale, remote_window_scale): (u32, u8) = match remote_window_scale {
+            Some(remote_window_scale) => {
+                if (remote_window_scale as usize) < MAX_WINDOW_SCALE {
+                    (self.tcp_config.get_window_scale() as u32, remote_window_scale)
+                } else {
+                    warn!(
+                        "remote windows scale larger than {:?} is incorrect, so setting to {:?}. See RFC 1323.",
+                        MAX_WINDOW_SCALE, MAX_WINDOW_SCALE
+                    );
+                    (self.tcp_config.get_window_scale() as u32, MAX_WINDOW_SCALE as u8)
+                }
+            },
             None => (0, 0),
         };
-        let remote_window_size = (header_window_size)
-            .checked_shl(remote_window_scale as u32)
-            .expect("TODO: Window size overflow")
-            .try_into()
-            .expect("TODO: Window size overflow");
-        let local_window_size = (self.tcp_config.get_receive_window_size() as u32)
-            .checked_shl(local_window_scale as u32)
-            .expect("TODO: Window size overflow");
+
+        // Expect is safe here because the window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14, so it is impossible to overflow the 32-bit
+        debug_assert!((remote_window_scale as usize) <= MAX_WINDOW_SCALE);
+        let remote_window_size: u32 = expect_some!(
+            (header_window_size as u32).checked_shl(remote_window_scale as u32),
+            "Window size overflow"
+        );
+        // Expect is safe here because the receive window size is a 16-bit unsigned integer and MAX_WINDOW_SCALE is 14,
+        // so it is impossible to overflow the 32-bit unsigned int.
+        debug_assert!((local_window_scale as usize) <= MAX_WINDOW_SCALE);
+        let local_window_size: u32 = expect_some!(
+            (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale),
+            "Window size overflow"
+        );
         info!(
             "Window sizes: local {}, remote {}",
             local_window_size, remote_window_size
@@ -275,13 +494,21 @@ impl<const N: usize> SharedPassiveSocket<N> {
             local_window_scale, remote_window_scale
         );
 
-        let mut new_socket: EstablishedSocket<N> = EstablishedSocket::<N>::new(
+        // If there is data with the SYN+ACK, deliver it.
+        if !buf.is_empty() {
+            recv_queue.push((ipv4_hdr, tcp_hdr, buf));
+        }
+
+        let new_socket: EstablishedSocket<N> = EstablishedSocket::<N>::new(
             self.local,
             remote,
             self.runtime.clone(),
             self.transport.clone(),
+            recv_queue.clone(),
+            ack_queue,
             self.local_link_addr,
             self.tcp_config.clone(),
+            self.socket_options,
             self.arp.clone(),
             remote_isn + SeqNumber::from(1),
             self.tcp_config.get_ack_delay_timeout(),
@@ -294,71 +521,10 @@ impl<const N: usize> SharedPassiveSocket<N> {
             congestion_control::None::new,
             None,
             self.dead_socket_tx.clone(),
+            Some(self.socket_queue.clone()),
         )?;
 
-        // If there is data with the SYN+ACK, deliver it.
-        if !buf.is_empty() {
-            new_socket.receive(header, buf);
-        }
-
-        // Remove SYN+ACK coroutine. Setting the yielder handle will keep it from being woken in the future.
-        inflight.yielder_handle.wake_with(Ok(()));
-        if let Err(e) = self.runtime.remove_background_coroutine(&inflight.handle) {
-            panic!("Failed to remove inflight accept (error={:?})", e);
-        }
-
-        self.ready.push(Ok(new_socket));
-        Ok(())
-    }
-
-    async fn send_syn_ack(
-        mut self,
-        remote: SocketAddrV4,
-        remote_isn: SeqNumber,
-        local_isn: SeqNumber,
-        yielder: Yielder,
-    ) {
-        let handshake_retries: usize = self.tcp_config.get_handshake_retries();
-        let handshake_timeout: Duration = self.tcp_config.get_handshake_timeout();
-
-        for _ in 0..handshake_retries {
-            let remote_link_addr = match self.arp.query(remote.ip().clone(), &Yielder::new()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("ARP query failed: {:?}", e);
-                    continue;
-                },
-            };
-            let mut tcp_hdr = TcpHeader::new(self.local.port(), remote.port());
-            tcp_hdr.syn = true;
-            tcp_hdr.seq_num = local_isn;
-            tcp_hdr.ack = true;
-            tcp_hdr.ack_num = remote_isn + SeqNumber::from(1);
-            tcp_hdr.window_size = self.tcp_config.get_receive_window_size();
-
-            let mss = self.tcp_config.get_advertised_mss() as u16;
-            tcp_hdr.push_option(TcpOptions2::MaximumSegmentSize(mss));
-            info!("Advertising MSS: {}", mss);
-
-            tcp_hdr.push_option(TcpOptions2::WindowScale(self.tcp_config.get_window_scale()));
-            info!("Advertising window scale: {}", self.tcp_config.get_window_scale());
-
-            debug!("Sending SYN+ACK: {:?}", tcp_hdr);
-            let segment = TcpSegment {
-                ethernet2_hdr: Ethernet2Header::new(remote_link_addr, self.local_link_addr, EtherType2::Ipv4),
-                ipv4_hdr: Ipv4Header::new(self.local.ip().clone(), remote.ip().clone(), IpProtocol::TCP),
-                tcp_hdr,
-                data: None,
-                tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
-            };
-            self.transport.transmit(Box::new(segment));
-            let clock_ref: SharedTimer = self.runtime.get_timer();
-            if let Err(e) = clock_ref.wait(handshake_timeout, &yielder).await {
-                self.ready.push(Err(e));
-                return;
-            }
-        }
-        self.ready.push(Err(Fail::new(ETIMEDOUT, "handshake timeout")));
+        Ok(new_socket)
     }
 }
 
@@ -366,7 +532,7 @@ impl<const N: usize> SharedPassiveSocket<N> {
 // Trait Implementations
 //======================================================================================================================
 
-impl<const N: usize> Deref for SharedPassiveSocket<N> {
+impl<N: NetworkRuntime> Deref for SharedPassiveSocket<N> {
     type Target = PassiveSocket<N>;
 
     fn deref(&self) -> &Self::Target {
@@ -374,7 +540,7 @@ impl<const N: usize> Deref for SharedPassiveSocket<N> {
     }
 }
 
-impl<const N: usize> DerefMut for SharedPassiveSocket<N> {
+impl<N: NetworkRuntime> DerefMut for SharedPassiveSocket<N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.deref_mut()
     }

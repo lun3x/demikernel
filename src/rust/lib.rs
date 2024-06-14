@@ -3,14 +3,12 @@
 
 #![cfg_attr(feature = "strict", deny(clippy:all))]
 #![recursion_limit = "512"]
-#![feature(atomic_from_mut)]
-#![feature(never_type)]
 #![feature(test)]
-#![feature(type_alias_impl_trait)]
 #![feature(allocator_api)]
-#![feature(slice_ptr_get)]
 #![feature(strict_provenance)]
 #![cfg_attr(target_os = "windows", feature(maybe_uninit_uninit_array))]
+#![feature(noop_waker)]
+#![feature(hash_extract_if)]
 
 mod collections;
 mod pal;
@@ -20,6 +18,12 @@ pub mod perftools;
 
 pub mod runtime;
 
+#[cfg(any(
+    feature = "catnap-libos",
+    feature = "catnip-libos",
+    feature = "catpowder-libos",
+    feature = "catloop-libos"
+))]
 pub mod inetstack;
 
 extern crate test;
@@ -36,9 +40,6 @@ mod catnip;
 #[cfg(feature = "catpowder-libos")]
 mod catpowder;
 
-#[cfg(feature = "catcollar-libos")]
-mod catcollar;
-
 #[cfg(all(feature = "catnap-libos"))]
 mod catnap;
 
@@ -53,9 +54,12 @@ pub use self::demikernel::libos::{
     LibOS,
 };
 pub use crate::runtime::{
-    network::types::{
-        MacAddress,
-        Port16,
+    network::{
+        socket::option::SocketOption,
+        types::{
+            MacAddress,
+            Port16,
+        },
     },
     types::{
         demi_sgarray_t,
@@ -68,6 +72,11 @@ pub use crate::runtime::{
 };
 
 pub mod demikernel;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 //======================================================================================================================
 // Macros
@@ -180,6 +189,84 @@ macro_rules! dump_test {
             Ok(())
         }
     }};
+}
+
+#[macro_export]
+macro_rules! expect_some {
+    ( $var:expr, $ex:expr $( , $arg:expr )* ) => {
+        $var.unwrap_or_else(|| panic!( $ex $(, $arg )* ))
+    };
+}
+
+#[macro_export]
+macro_rules! expect_ok {
+    ( $var:expr, $ex:expr $( , $arg:expr )* ) => {
+        $var.unwrap_or_else(|_| panic!( $ex $(, $arg )* ))
+    };
+}
+
+/// Use this macro to add the current scope to profiling. In effect, the time
+/// taken from entering to leaving the scope will be measured.
+///
+/// Internally, the scope is inserted in the scope tree of the global
+/// thread-local [`PROFILER`](constant.PROFILER.html).
+///
+/// # Example
+///
+/// The following example will profile the scope `"foo"`, which has the scope
+/// `"bar"` as a child.
+///
+/// ```
+/// use inetstack::timer;
+///
+/// {
+///     timer!("foo");
+///
+///     {
+///         timer!("bar");
+///         // ... do something ...
+///     }
+///
+///     // ... do some more ...
+/// }
+/// ```
+
+#[macro_export]
+macro_rules! timer {
+    ($name:expr) => {
+        #[cfg(feature = "profiler")]
+        let _guard = $crate::perftools::profiler::PROFILER.with(|p| p.borrow_mut().sync_scope($name));
+    };
+}
+
+#[cfg(feature = "profiler")]
+#[macro_export]
+macro_rules! async_timer {
+    ($name:expr, $future:expr) => {
+        async {
+            std::pin::pin!($crate::perftools::profiler::AsyncScope::new(
+                $crate::perftools::profiler::PROFILER.with(|p| p.borrow_mut().get_scope($name)),
+                std::pin::pin!($future).as_mut()
+            ))
+            .await
+        }
+    };
+}
+
+#[cfg(not(feature = "profiler"))]
+#[macro_export]
+macro_rules! async_timer {
+    ($name:expr, $future:expr) => {
+        $future
+    };
+}
+
+#[cfg(feature = "profiler")]
+#[macro_export]
+macro_rules! coroutine_timer {
+    ($name:expr, $future:expr) => {
+        Box::pin($crate::perftools::profiler::Profiler::coroutine_scope($name, $future).fuse())
+    };
 }
 
 #[test]

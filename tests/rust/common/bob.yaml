@@ -1,0 +1,33 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+demikernel:
+  local_ipv4_addr: 192.168.1.2
+  local_link_addr: "ab:89:67:45:23:12"
+raw_socket:
+  interface_name: "abcde"
+dpdk:
+  eal_init: ["", "-c", "0xff", "-n", "4", "-a", "WW:WW.W","--proc-type=auto"]
+tcp_socket_options:
+  keepalive:
+    enabled: false
+    time_millis: 0
+    interval: 0
+  linger:
+    enabled: true
+    time_seconds: 0
+  nodelay: true
+inetstack_config:
+  mtu: 1500
+  mss: 1500
+  enable_jumbo_frames: false
+  udp_checksum_offload: false
+  tcp_checksum_offload: false
+  arp_table:
+    "12:23:45:67:89:ab": "127.0.0.1"
+    "ab:89:67:45:23:12": "192.168.1.2"
+  arp_request_retries: 2
+  arp_request_timeout: 1
+  arp_cache_ttl: 600
+
+# vim: set tabstop=2 shiftwidth=2

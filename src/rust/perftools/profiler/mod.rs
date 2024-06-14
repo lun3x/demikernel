@@ -1,18 +1,40 @@
 // Copyright(c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! This module provides a small performance profiler for the Demikernel libOSes.
+
+//======================================================================================================================
+// Exports
+//======================================================================================================================
+
+mod scope;
+pub use crate::perftools::profiler::scope::AsyncScope;
 #[cfg(test)]
 mod tests;
 
-use std::{
+//======================================================================================================================
+// Imports
+//======================================================================================================================
+
+use crate::perftools::profiler::scope::{
+    Guard,
+    Scope,
+};
+use ::futures::future::FusedFuture;
+use ::std::{
     cell::RefCell,
     io,
+    pin::Pin,
     rc::Rc,
     time::{
         Duration,
         SystemTime,
     },
 };
+
+//======================================================================================================================
+// Structures
+//======================================================================================================================
 
 #[cfg(feature = "auto-calibrate")]
 const SAMPLE_SIZE: usize = 16641;
@@ -22,38 +44,23 @@ thread_local!(
     pub static PROFILER: RefCell<Profiler> = RefCell::new(Profiler::new())
 );
 
-/// Use this macro to add the current scope to profiling. In effect, the time
-/// taken from entering to leaving the scope will be measured.
+/// A `Profiler` stores the scope tree and keeps track of the currently active
+/// scope.
 ///
-/// Internally, the scope is inserted in the scope tree of the global
-/// thread-local [`PROFILER`](constant.PROFILER.html).
-///
-/// # Example
-///
-/// The following example will profile the scope `"foo"`, which has the scope
-/// `"bar"` as a child.
-///
-/// ```
-/// use inetstack::timer;
-///
-/// {
-///     timer!("foo");
-///
-///     {
-///         timer!("bar");
-///         // ... do something ...
-///     }
-///
-///     // ... do some more ...
-/// }
-/// ```
-
-#[macro_export]
-macro_rules! timer {
-    ($name:expr) => {
-        let _guard = $crate::perftools::profiler::PROFILER.with(|p| p.borrow_mut().enter($name));
-    };
+/// Note that there is a global thread-local instance of `Profiler` in
+/// [`PROFILER`](constant.PROFILER.html), so it is not possible to manually
+/// create an instance of `Profiler`.
+pub struct Profiler {
+    roots: Vec<Rc<RefCell<Scope>>>,
+    current: Option<Rc<RefCell<Scope>>>,
+    ns_per_cycle: f64,
+    #[cfg(feature = "auto-calibrate")]
+    clock_drift: u64,
 }
+
+//======================================================================================================================
+// Associated Functions
+//======================================================================================================================
 
 /// Print profiling scope tree.
 ///
@@ -72,145 +79,6 @@ pub fn reset() {
     PROFILER.with(|p| p.borrow_mut().reset());
 }
 
-//==============================================================================
-//
-//==============================================================================
-
-/// Internal representation of scopes as a tree.
-struct Scope {
-    /// Name of the scope.
-    name: &'static str,
-
-    /// Parent scope in the tree. Root scopes have no parent.
-    pred: Option<Rc<RefCell<Scope>>>,
-
-    /// Child scopes in the tree.
-    succs: Vec<Rc<RefCell<Scope>>>,
-
-    /// How often has this scope been visited?
-    num_calls: usize,
-
-    /// In total, how much time has been spent in this scope?
-    duration_sum: u64,
-}
-
-impl Scope {
-    fn new(name: &'static str, pred: Option<Rc<RefCell<Scope>>>) -> Scope {
-        Scope {
-            name,
-            pred,
-            succs: Vec::new(),
-            num_calls: 0,
-            duration_sum: 0,
-        }
-    }
-
-    /// Enter this scope. Returns a `Guard` instance that should be dropped
-    /// when leaving the scope.
-    #[inline]
-    fn enter(&mut self) -> Guard {
-        Guard::enter()
-    }
-
-    /// Leave this scope. Called automatically by the `Guard` instance.
-    #[inline]
-    fn leave(&mut self, duration: u64) {
-        self.num_calls += 1;
-
-        // Even though this is extremely unlikely, let's not panic on overflow.
-        self.duration_sum = self.duration_sum + duration;
-    }
-
-    fn write_recursive<W: io::Write>(
-        &self,
-        out: &mut W,
-        total_duration: u64,
-        depth: usize,
-        max_depth: Option<usize>,
-        ns_per_cycle: f64,
-    ) -> io::Result<()> {
-        if let Some(d) = max_depth {
-            if depth > d {
-                return Ok(());
-            }
-        }
-
-        let total_duration_secs = (total_duration) as f64;
-        let duration_sum_secs = (self.duration_sum) as f64;
-        let pred_sum_secs = self
-            .pred
-            .clone()
-            .map_or(total_duration_secs, |pred| (pred.borrow().duration_sum) as f64);
-        let percent = duration_sum_secs / pred_sum_secs * 100.0;
-
-        // Write markers.
-        let mut markers = String::from("+");
-        for _ in 0..depth {
-            markers.push('+');
-        }
-        writeln!(
-            out,
-            "{};{};{};{}",
-            format!("{};{}", markers, self.name),
-            percent,
-            duration_sum_secs / (self.num_calls as f64),
-            duration_sum_secs / (self.num_calls as f64) * ns_per_cycle,
-        )?;
-
-        // Write children
-        for succ in &self.succs {
-            succ.borrow()
-                .write_recursive(out, total_duration, depth + 1, max_depth, ns_per_cycle)?;
-        }
-
-        Ok(())
-    }
-}
-
-//==============================================================================
-//
-//==============================================================================
-
-/// A guard that is created when entering a scope and dropped when leaving it.
-pub struct Guard {
-    enter_time: u64,
-}
-
-impl Guard {
-    #[inline]
-    fn enter() -> Self {
-        let (now, _): (u64, u32) = unsafe { x86::time::rdtscp() };
-        Self { enter_time: now }
-    }
-}
-
-impl Drop for Guard {
-    #[inline]
-    fn drop(&mut self) {
-        let (now, _): (u64, u32) = unsafe { x86::time::rdtscp() };
-        let duration: u64 = now - self.enter_time;
-        PROFILER.with(|p| p.borrow_mut().leave(duration));
-    }
-}
-
-//==============================================================================
-//
-//==============================================================================
-
-/// A `Profiler` stores the scope tree and keeps track of the currently active
-/// scope.
-///
-/// Note that there is a global thread-local instance of `Profiler` in
-/// [`PROFILER`](constant.PROFILER.html), so it is not possible to manually
-/// create an instance of `Profiler`.
-pub struct Profiler {
-    roots: Vec<Rc<RefCell<Scope>>>,
-    current: Option<Rc<RefCell<Scope>>>,
-    ns_per_cycle: f64,
-    #[cfg(feature = "auto-calibrate")]
-    clock_drift: u64,
-}
-
 impl Profiler {
     fn new() -> Profiler {
         Profiler {
@@ -222,23 +90,56 @@ impl Profiler {
         }
     }
 
-    /// Enter a scope. Returns a [`Guard`](struct.Guard.html) that should be
+    /// Create and enter a syncronous scope. Returns a [`Guard`](struct.Guard.html) that should be
     /// dropped upon leaving the scope.
     ///
     /// Usually, this method will be called by the
     /// [`profile`](macro.profile.html) macro, so it does not need to be used
     /// directly.
     #[inline]
-    pub fn enter(&mut self, name: &'static str) -> Guard {
+    pub fn sync_scope(&mut self, name: &'static str) -> Guard {
+        let scope = self.get_scope(name);
+        self.enter_scope(scope)
+    }
+
+    /// Create and enter a coroutine scope. These are special async scopes that are always rooted because they do not
+    /// run under other scopes.
+    #[inline]
+    pub async fn coroutine_scope<F: FusedFuture>(name: &'static str, mut coroutine: Pin<Box<F>>) -> F::Output {
+        AsyncScope::new(
+            PROFILER.with(|p| p.borrow_mut().get_root_scope(name)),
+            coroutine.as_mut(),
+        )
+        .await
+    }
+
+    /// Looks up the scope at the root level using the name, creating a new one if not found.
+    fn get_root_scope(&mut self, name: &'static str) -> Rc<RefCell<Scope>> {
+        //Check if `name` already is a root.
+        let existing_root = self.roots.iter().find(|root| root.borrow().get_name() == name).cloned();
+
+        existing_root.unwrap_or_else(|| {
+            // Add a new root node.
+            let new_scope = Scope::new(name, None);
+            let succ = Rc::new(RefCell::new(new_scope));
+
+            self.roots.push(succ.clone());
+
+            succ
+        })
+    }
+
+    /// Look up the scope using the name.
+    pub fn get_scope(&mut self, name: &'static str) -> Rc<RefCell<Scope>> {
         // Check if we have already registered `name` at the current point in
         // the tree.
-        let succ = if let Some(current) = self.current.as_ref() {
+        if let Some(current) = self.current.as_ref() {
             // We are currently in some scope.
             let existing_succ = current
                 .borrow()
-                .succs
+                .get_succs()
                 .iter()
-                .find(|succ| succ.borrow().name == name)
+                .find(|succ| succ.borrow().get_name() == name)
                 .cloned();
 
             existing_succ.unwrap_or_else(|| {
@@ -246,29 +147,21 @@ impl Profiler {
                 let new_scope = Scope::new(name, Some(current.clone()));
                 let succ = Rc::new(RefCell::new(new_scope));
 
-                current.borrow_mut().succs.push(succ.clone());
+                current.borrow_mut().add_succ(succ.clone());
 
                 succ
             })
         } else {
-            // We are currently not within any scope. Check if `name` already
-            // is a root.
-            let existing_root = self.roots.iter().find(|root| root.borrow().name == name).cloned();
+            // We are currently not within any scope.
+            self.get_root_scope(name)
+        }
+    }
 
-            existing_root.unwrap_or_else(|| {
-                // Add a new root node.
-                let new_scope = Scope::new(name, None);
-                let succ = Rc::new(RefCell::new(new_scope));
+    /// Actually enter a scope.
+    fn enter_scope(&mut self, scope: Rc<RefCell<Scope>>) -> Guard {
+        let guard = scope.borrow_mut().enter();
 
-                self.roots.push(succ.clone());
-
-                succ
-            })
-        };
-
-        let guard = succ.borrow_mut().enter();
-
-        self.current = Some(succ);
+        self.current = Some(scope);
 
         guard
     }
@@ -285,7 +178,7 @@ impl Profiler {
 
     /// Leave the current scope.
     #[inline]
-    fn leave(&mut self, duration: u64) {
+    fn leave_scope(&mut self, duration: u64) {
         self.current = if let Some(current) = self.current.as_ref() {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "auto-calibrate")] {
@@ -297,7 +190,7 @@ impl Profiler {
             }
 
             // Set current scope back to the parent node (if any).
-            current.borrow().pred.as_ref().cloned()
+            current.borrow().get_pred().as_ref().cloned()
         } else {
             // This should not happen with proper usage.
             log::error!("Called perftools::profiler::leave() while not in any scope");
@@ -307,7 +200,7 @@ impl Profiler {
     }
 
     fn write<W: io::Write>(&self, out: &mut W, max_depth: Option<usize>) -> io::Result<()> {
-        let total_duration = self.roots.iter().map(|root| root.borrow().duration_sum).sum();
+        let total_duration = self.roots.iter().map(|root| root.borrow().get_duration_sum()).sum();
 
         writeln!(
             out,
@@ -346,5 +239,16 @@ impl Profiler {
         }
 
         total / (nsamples as u64)
+    }
+}
+
+//======================================================================================================================
+// Trait Implementations
+//======================================================================================================================
+
+impl Drop for Profiler {
+    fn drop(&mut self) {
+        self.write(&mut std::io::stdout(), None)
+            .expect("failed to write to stdout");
     }
 }

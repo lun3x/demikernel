@@ -1,18 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//==============================================================================
+//======================================================================================================================
 // Imports
-//==============================================================================
+//======================================================================================================================
 
-use super::{
-    datagram::UdpHeader,
-    queue::SharedUdpQueue,
-};
 use crate::{
+    demikernel::config::Config,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ipv4::Ipv4Header,
+        udp::{
+            datagram::UdpHeader,
+            socket::SharedUdpSocket,
+        },
     },
     runtime::{
         fail::Fail,
@@ -21,33 +22,24 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        queue::{
-            downcast_queue_ptr,
-            NetworkQueue,
-            OperationResult,
-            QDesc,
-        },
-        scheduler::Yielder,
-        Operation,
-        SharedBox,
         SharedDemiRuntime,
         SharedObject,
     },
+    timer,
 };
+
 use ::std::{
+    collections::HashMap,
     net::{
         Ipv4Addr,
+        SocketAddr,
         SocketAddrV4,
     },
     ops::{
         Deref,
         DerefMut,
     },
-    pin::Pin,
 };
-
-#[cfg(feature = "profiler")]
-use crate::timer;
 
 //======================================================================================================================
 // Structures
@@ -55,11 +47,9 @@ use crate::timer;
 /// Per-queue metadata: UDP Control Block
 
 /// UDP Peer
-pub struct UdpPeer<const N: usize> {
-    /// Shared Demikernel runtime.
-    runtime: SharedDemiRuntime,
+pub struct UdpPeer<N: NetworkRuntime> {
     /// Underlying transport.
-    transport: SharedBox<dyn NetworkRuntime<N>>,
+    transport: N,
     /// Underlying ARP peer.
     arp: SharedArpPeer<N>,
     /// Local link address.
@@ -68,10 +58,12 @@ pub struct UdpPeer<const N: usize> {
     local_ipv4_addr: Ipv4Addr,
     /// Offload checksum to hardware?
     checksum_offload: bool,
+    /// Incoming routing table.
+    addresses: HashMap<SocketAddrV4, SharedUdpSocket<N>>,
 }
 
 #[derive(Clone)]
-pub struct SharedUdpPeer<const N: usize>(SharedObject<UdpPeer<N>>);
+pub struct SharedUdpPeer<N: NetworkRuntime>(SharedObject<UdpPeer<N>>);
 
 //======================================================================================================================
 // Associate Functions
@@ -79,157 +71,131 @@ pub struct SharedUdpPeer<const N: usize>(SharedObject<UdpPeer<N>>);
 
 /// Associate functions for [SharedUdpPeer].
 
-impl<const N: usize> SharedUdpPeer<N> {
+impl<N: NetworkRuntime> SharedUdpPeer<N> {
     pub fn new(
-        runtime: SharedDemiRuntime,
-        transport: SharedBox<dyn NetworkRuntime<N>>,
-        local_link_addr: MacAddress,
-        local_ipv4_addr: Ipv4Addr,
-        offload_checksum: bool,
+        config: &Config,
+        _runtime: SharedDemiRuntime,
+        transport: N,
         arp: SharedArpPeer<N>,
     ) -> Result<Self, Fail> {
         Ok(Self(SharedObject::<UdpPeer<N>>::new(UdpPeer {
-            runtime,
             transport,
             arp,
-            local_link_addr,
-            local_ipv4_addr,
-            checksum_offload: offload_checksum,
+            local_link_addr: config.local_link_addr()?,
+            local_ipv4_addr: config.local_ipv4_addr()?,
+            checksum_offload: config.udp_checksum_offload()?,
+            addresses: HashMap::<SocketAddrV4, SharedUdpSocket<N>>::new(),
         })))
     }
 
     /// Opens a UDP socket.
-    pub fn socket(&mut self) -> Result<QDesc, Fail> {
-        let new_queue: SharedUdpQueue<N> = SharedUdpQueue::new(
+    pub fn socket(&mut self) -> Result<SharedUdpSocket<N>, Fail> {
+        SharedUdpSocket::<N>::new(
             self.local_ipv4_addr,
             self.local_link_addr,
             self.transport.clone(),
             self.arp.clone(),
             self.checksum_offload,
-        )?;
-        let new_qd: QDesc = self.runtime.alloc_queue::<SharedUdpQueue<N>>(new_queue);
-        trace!("socket(): qd={:?}", new_qd);
-        Ok(new_qd)
+        )
     }
 
     /// Binds a UDP socket to a local endpoint address.
-    pub fn bind(&mut self, qd: QDesc, mut addr: SocketAddrV4) -> Result<(), Fail> {
-        trace!("bind(): qd={:?}", qd);
-        // Check whether queue is already bound.
-        let mut queue: SharedUdpQueue<N> = self.get_shared_queue(&qd)?;
-
-        if let Some(_) = queue.local() {
+    pub fn bind(&mut self, socket: &mut SharedUdpSocket<N>, addr: SocketAddrV4) -> Result<(), Fail> {
+        if let Some(_) = socket.local() {
             let cause: String = format!("cannot bind to already bound socket");
             error!("bind(): {}", cause);
             return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
 
-        // Check whether address is in use.
-        // TODO: Move to addr_in_use in runtime eventually.
-        if self.runtime.addr_in_use(addr) {
-            let cause: String = format!("address is already bound to socket");
-            error!("bind(): {}", cause);
-            return Err(Fail::new(libc::EADDRINUSE, &cause));
-        }
-
-        // Check if this is an ephemeral port or a wildcard one.
-        if SharedDemiRuntime::is_private_ephemeral_port(addr.port()) {
-            // Allocate ephemeral port from the pool, to leave  ephemeral port allocator in a consistent state.
-            self.runtime.reserve_ephemeral_port(addr.port())?
-        } else if addr.port() == 0 {
-            // Allocate ephemeral port.
-            // TODO: we should free this when closing.
-            let new_port: u16 = self.runtime.alloc_ephemeral_port()?;
-            addr.set_port(new_port);
-        }
-
-        queue.bind(addr)?;
+        socket.bind(addr)?;
+        self.addresses.insert(addr.clone(), socket.clone());
         Ok(())
     }
 
     /// Closes a UDP socket.
-    pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
-        trace!("close(): qd={:?}", qd);
-        let mut queue: SharedUdpQueue<N> = self.runtime.free_queue::<SharedUdpQueue<N>>(&qd)?;
-        queue.close()?;
+    pub fn hard_close(&mut self, socket: &mut SharedUdpSocket<N>) -> Result<(), Fail> {
+        if let Some(addr) = socket.local() {
+            self.addresses.remove(&addr);
+        }
         Ok(())
     }
 
+    /// Closes a UDP socket asynchronously.
+    pub async fn close(&mut self, socket: &mut SharedUdpSocket<N>) -> Result<(), Fail> {
+        self.hard_close(socket)
+    }
+
     /// Pushes data to a remote UDP peer.
-    pub fn pushto(&mut self, qd: QDesc, buf: DemiBuffer, remote: SocketAddrV4) -> Result<Pin<Box<Operation>>, Fail> {
-        trace!("pushto(): qd={:?} remote={:?} bytes={:?}", qd, remote, buf.len());
-        let mut queue: SharedUdpQueue<N> = self.get_shared_queue(&qd)?;
+    pub async fn push(
+        &mut self,
+        socket: &mut SharedUdpSocket<N>,
+        buf: &mut DemiBuffer,
+        remote: Option<SocketAddr>,
+    ) -> Result<(), Fail> {
         // TODO: Allocate ephemeral port if not bound.
         // FIXME: https://github.com/microsoft/demikernel/issues/973
-        if !queue.is_bound() {
+        if !socket.is_bound() {
             let cause: String = format!("queue is not bound");
             error!("pushto(): {}", &cause);
             return Err(Fail::new(libc::ENOTSUP, &cause));
         }
-        let yielder: Yielder = Yielder::new();
-        Ok(Box::pin(async move {
-            match queue.pushto(remote, buf, yielder).await {
-                Ok(()) => (qd, OperationResult::Push),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        }))
+        // TODO: Remove copy once we actually use push coroutine for send.
+        socket.push(remote, buf.clone()).await?;
+        buf.trim(buf.len())
     }
 
     /// Pops data from a socket.
-    pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<Pin<Box<Operation>>, Fail> {
-        let yielder: Yielder = Yielder::new();
-        let mut queue: SharedUdpQueue<N> = self.get_shared_queue(&qd)?;
-
-        Ok(Box::pin(async move {
-            match queue.pop(size, yielder).await {
-                Ok((addr, buf)) => (qd, OperationResult::Pop(Some(addr), buf)),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        }))
+    pub async fn pop(
+        &mut self,
+        socket: &mut SharedUdpSocket<N>,
+        size: usize,
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
+        let (addr, buf) = socket.pop(size).await?;
+        Ok((Some(addr.into()), buf))
     }
 
     /// Consumes the payload from a buffer.
-    pub fn receive(&mut self, ipv4_hdr: &Ipv4Header, buf: DemiBuffer) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
+    pub fn receive(&mut self, ipv4_hdr: Ipv4Header, buf: DemiBuffer) {
         timer!("udp::receive");
         // Parse datagram.
-        let (hdr, data): (UdpHeader, DemiBuffer) = UdpHeader::parse(ipv4_hdr, buf, self.checksum_offload)?;
+        let (hdr, data): (UdpHeader, DemiBuffer) = match UdpHeader::parse(&ipv4_hdr, buf, self.checksum_offload) {
+            Ok(result) => result,
+            Err(e) => {
+                let cause: String = format!("dropping packet: unable to parse UDP header");
+                warn!("{}: {:?}", cause, e);
+                return;
+            },
+        };
         debug!("UDP received {:?}", hdr);
 
         let local: SocketAddrV4 = SocketAddrV4::new(ipv4_hdr.get_dest_addr(), hdr.dest_port());
         let remote: SocketAddrV4 = SocketAddrV4::new(ipv4_hdr.get_src_addr(), hdr.src_port());
 
-        let mut queue: SharedUdpQueue<N> = match self.get_queue_from_addr(&local) {
+        let socket: &mut SharedUdpSocket<N> = match self.get_socket_from_addr(&local) {
             Some(queue) => queue,
             None => {
                 // Handle wildcard address.
                 let local: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, hdr.dest_port());
-                match self.get_queue_from_addr(&local) {
+                match self.get_socket_from_addr(&local) {
                     Some(queue) => queue,
-                    None => return Err(Fail::new(libc::ENOTCONN, "port not bound")),
+                    None => {
+                        // RFC 792 specifies that an ICMP message may be sent in response to a packet sent to an unbound
+                        // port. However, we simply drop the datagram as this could be a port-scan attack, and not
+                        // sending an ICMP message is a valid action. See https://www.rfc-editor.org/rfc/rfc792 for more
+                        // details.
+                        let cause: String = format!("dropping packet: port not bound");
+                        warn!("{}: {:?}", cause, local);
+                        return;
+                    },
                 }
             },
         };
         // TODO: Drop this packet if local address/port pair is not bound.
-        queue.receive(remote, data)
+        socket.receive(remote, data)
     }
 
-    fn get_queue_from_addr(&self, local: &SocketAddrV4) -> Option<SharedUdpQueue<N>> {
-        for (_, boxed_queue) in self.runtime.get_qtable().get_values() {
-            match downcast_queue_ptr::<SharedUdpQueue<N>>(boxed_queue) {
-                Ok(queue) => match queue.local() {
-                    Some(addr) if addr == *local => return Some(queue.clone()),
-                    _ => continue,
-                },
-                Err(_) => continue,
-            }
-        }
-
-        None
-    }
-
-    fn get_shared_queue(&self, qd: &QDesc) -> Result<SharedUdpQueue<N>, Fail> {
-        Ok(self.runtime.get_shared_queue::<SharedUdpQueue<N>>(qd)?.clone())
+    fn get_socket_from_addr(&mut self, local: &SocketAddrV4) -> Option<&mut SharedUdpSocket<N>> {
+        self.addresses.get_mut(local)
     }
 }
 
@@ -237,7 +203,7 @@ impl<const N: usize> SharedUdpPeer<N> {
 // Trait Implementations
 //======================================================================================================================
 
-impl<const N: usize> Deref for SharedUdpPeer<N> {
+impl<N: NetworkRuntime> Deref for SharedUdpPeer<N> {
     type Target = UdpPeer<N>;
 
     fn deref(&self) -> &Self::Target {
@@ -245,7 +211,7 @@ impl<const N: usize> Deref for SharedUdpPeer<N> {
     }
 }
 
-impl<const N: usize> DerefMut for SharedUdpPeer<N> {
+impl<N: NetworkRuntime> DerefMut for SharedUdpPeer<N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.deref_mut()
     }

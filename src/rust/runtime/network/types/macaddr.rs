@@ -6,9 +6,11 @@
 //==============================================================================
 
 use crate::runtime::fail::Fail;
-use ::eui48;
 use ::libc::EINVAL;
-use ::std::fmt;
+use ::std::{
+    fmt,
+    str::FromStr,
+};
 
 //==============================================================================
 // Structures
@@ -108,5 +110,13 @@ impl fmt::Display for MacAddress {
 impl fmt::Debug for MacAddress {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "MacAddress({})", &self.to_canonical())
+    }
+}
+
+impl FromStr for MacAddress {
+    type Err = Fail;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MacAddress::parse_str(s)
     }
 }

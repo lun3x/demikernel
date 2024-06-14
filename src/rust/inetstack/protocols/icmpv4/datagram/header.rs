@@ -1,22 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use super::protocol::Icmpv4Type2;
+//======================================================================================================================
+// Imports
+//======================================================================================================================
+
 use crate::{
+    inetstack::protocols::{
+        compute_generic_checksum,
+        fold16,
+        icmpv4::datagram::Icmpv4Type2,
+    },
     runtime::{
         fail::Fail,
         memory::DemiBuffer,
     },
-    inetstack::protocols::{
-        fold16,
-        compute_generic_checksum,
-    }
 };
 use ::libc::EBADMSG;
-use ::std::convert::TryInto;
+
+//======================================================================================================================
+// Constants
+//======================================================================================================================
 
 /// Size of ICMPv4 Headers (in bytes)
 pub const ICMPV4_HEADER_SIZE: usize = 8;
+
+//======================================================================================================================
+// Structures
+//======================================================================================================================
 
 #[derive(Copy, Clone, Debug)]
 pub struct Icmpv4Header {
@@ -24,6 +35,10 @@ pub struct Icmpv4Header {
     // TODO: Turn this into an enum on Icmpv4Type2 and then collapse the struct.
     code: u8,
 }
+
+//======================================================================================================================
+// Associate Functions
+//======================================================================================================================
 
 /// Associate Functions for Icmpv4Header
 impl Icmpv4Header {

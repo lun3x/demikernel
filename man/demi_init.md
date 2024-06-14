@@ -28,7 +28,6 @@ All arguments supported by Demikernel are listed in the table below. Arguments t
 
 | ID      | Argument      | Description                       | Supported OS |
 | ------- | ------------- | --------------------------------- | ------------ |
-| `ARG-1` | `--catcollar` | Enables I/O Uring LibOS           | Linux        |
 | `ARG-2` | `--catloop`   | Enables TCP Socket Loopback LibOS | Linux        |
 | `ARG-3` | `--catmem`    | Enables Shared Memory LibOS       | Linux        |
 | `ARG-4` | `--catnap`    | Enables Linux Sockets LibOS       | Linux        |
@@ -49,6 +48,7 @@ On error, one of the following positive error codes is returned:
 
 - `EINVAL` - The `argc` argument is less than or equal to zero.
 - `EINVAL` - The `argv` argument is `NULL`.
+- `EEXIST` - The LibOS has already been initialized.
 
 ## Conforming To
 

@@ -10,17 +10,27 @@ pub mod consts;
 pub mod ephemeral;
 pub mod ring;
 pub mod socket;
+pub mod transport;
 pub mod types;
 
 //======================================================================================================================
 // Imports
 //======================================================================================================================
 
-use crate::runtime::{
-    memory::DemiBuffer,
-    network::socket::SocketId,
-    Fail,
-    QDesc,
+use crate::{
+    demikernel::config::Config,
+    runtime::{
+        memory::{
+            DemiBuffer,
+            MemoryRuntime,
+        },
+        network::{
+            consts::RECEIVE_BATCH_SIZE,
+            socket::SocketId,
+        },
+        Fail,
+        QDesc,
+    },
 };
 use ::arrayvec::ArrayVec;
 use ::std::{
@@ -112,10 +122,13 @@ pub trait PacketBuf {
 }
 
 /// Network Runtime
-pub trait NetworkRuntime<const N: usize> {
+pub trait NetworkRuntime: Clone + 'static + MemoryRuntime {
+    /// Creates a new NetworkRuntime with the [config] parameters.
+    fn new(config: &Config) -> Result<Self, Fail>;
+
     /// Transmits a single [PacketBuf].
     fn transmit(&mut self, pkt: Box<dyn PacketBuf>);
 
     /// Receives a batch of [DemiBuffer].
-    fn receive(&mut self) -> ArrayVec<DemiBuffer, N>;
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE>;
 }

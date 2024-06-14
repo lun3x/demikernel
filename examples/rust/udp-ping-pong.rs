@@ -22,6 +22,7 @@ use ::std::{
     net::SocketAddr,
     slice,
     str::FromStr,
+    time::Duration,
 };
 
 #[cfg(target_os = "windows")]
@@ -36,9 +37,6 @@ pub const AF_INET: i32 = libc::AF_INET;
 #[cfg(target_os = "linux")]
 pub const SOCK_DGRAM: i32 = libc::SOCK_DGRAM;
 
-#[cfg(feature = "profiler")]
-use ::demikernel::perftools::profiler;
-
 //======================================================================================================================
 // Constants
 //======================================================================================================================
@@ -46,6 +44,7 @@ use ::demikernel::perftools::profiler;
 const FILL_CHAR: u8 = 0x65;
 const BUFFER_SIZE: usize = 64;
 const NPINGS: usize = 64;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 //======================================================================================================================
 // mksga()
@@ -140,7 +139,7 @@ impl UdpServer {
                 Ok(qt) => qt,
                 Err(e) => anyhow::bail!("pop failed: {:?}", e),
             };
-            self.sga = match self.libos.wait(qt, None) {
+            self.sga = match self.libos.wait(qt, Some(DEFAULT_TIMEOUT)) {
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_POP => unsafe { Some(qr.qr_value.sga) },
                 Ok(_) => anyhow::bail!("unexpected result"),
                 Err(e) => anyhow::bail!("operation failed: {:?}", e),
@@ -166,7 +165,7 @@ impl UdpServer {
                     anyhow::bail!("push failed: {:?}", e)
                 },
             };
-            match self.libos.wait(qt, None) {
+            match self.libos.wait(qt, Some(DEFAULT_TIMEOUT)) {
                 Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_PUSH => (),
                 Ok(_) => anyhow::bail!("unexpected result"),
                 Err(e) => anyhow::bail!("operation failed: {:?}", e),
@@ -253,7 +252,7 @@ impl UdpClient {
         // Send packets.
         let mut i: usize = 0;
         while i < npings {
-            let (index, qr): (usize, demi_qresult_t) = match self.libos.wait_any(&qts, None) {
+            let (index, qr): (usize, demi_qresult_t) = match self.libos.wait_any(&qts, Some(DEFAULT_TIMEOUT)) {
                 Ok((index, qr)) => (index, qr),
                 Err(e) => anyhow::bail!("operation failed: {:?}", e),
             };
@@ -301,9 +300,6 @@ impl UdpClient {
                 _ => anyhow::bail!("unexpected operation result"),
             }
         }
-
-        #[cfg(feature = "profiler")]
-        profiler::write(&mut std::io::stdout(), None).expect("failed to write to stdout");
 
         // TODO: close socket when we get close working properly in catnip.
 

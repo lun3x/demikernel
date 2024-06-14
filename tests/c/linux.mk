@@ -5,13 +5,8 @@
 # Toolchain Configuration
 #=======================================================================================================================
 
-# Rust
-export CARGO ?= $(HOME)/.cargo/bin/cargo
-export CARGO_FLAGS += --profile $(BUILD)
-
 # C
-export CC := gcc
-export CFLAGS := -Werror -Wall -Wextra -O3 -I $(INCDIR) -std=c99
+export CFLAGS += -Werror -Wall -Wextra -std=c99
 export CFLAGS += -D_POSIX_C_SOURCE=199309L
 
 #=======================================================================================================================
@@ -33,10 +28,14 @@ export COMPILE_CMD = $(CC) $(CFLAGS) $@.o -o $(BINDIR)/$@.$(EXEC_SUFFIX) $(LIBS)
 #=======================================================================================================================
 
 # Builds everything.
-all: syscalls
+all: sizes syscalls
 
 make-dirs:
 	mkdir -p $(BINDIR)
+
+# Builds 'sizes' test.
+sizes: make-dirs sizes.o
+	$(COMPILE_CMD)
 
 # Builds system call test.
 syscalls: make-dirs syscalls.o
@@ -45,6 +44,7 @@ syscalls: make-dirs syscalls.o
 # Cleans up all build artifacts.
 clean:
 	@rm -rf $(OBJ)
+	@rm -rf $(BINDIR)/sizes.$(EXEC_SUFFIX)
 	@rm -rf $(BINDIR)/syscalls.$(EXEC_SUFFIX)
 
 # Builds a C source file.

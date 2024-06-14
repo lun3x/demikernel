@@ -5,10 +5,18 @@
 // Imports
 //==============================================================================
 
-use crate::runtime::network::consts::{
-    DEFAULT_MSS,
-    MAX_MSS,
-    MIN_MSS,
+use crate::{
+    demikernel::config::Config,
+    runtime::{
+        fail::Fail,
+        network::consts::{
+            DEFAULT_MSS,
+            MAX_MSS,
+            MIN_MSS,
+            TCP_ACK_DELAY_TIMEOUT,
+            TCP_HANDSHAKE_TIMEOUT,
+        },
+    },
 };
 use ::std::time::Duration;
 
@@ -44,44 +52,20 @@ pub struct TcpConfig {
 /// Associate Functions for TCP Configuration Descriptor
 impl TcpConfig {
     /// Creates a TCP Configuration Descriptor.
-    pub fn new(
-        advertised_mss: Option<usize>,
-        handshake_retries: Option<usize>,
-        handshake_timeout: Option<Duration>,
-        receive_window_size: Option<u16>,
-        window_scale: Option<u8>,
-        ack_delay_timeout: Option<Duration>,
-        rx_checksum_offload: Option<bool>,
-        tx_checksum_offload: Option<bool>,
-    ) -> Self {
+    pub fn new(config: &Config) -> Result<Self, Fail> {
         let mut options = Self::default();
 
-        if let Some(value) = advertised_mss {
-            options = options.set_advertised_mss(value);
+        if let Ok(value) = config.mss() {
+            assert!(value >= MIN_MSS);
+            assert!(value <= MAX_MSS);
+            options.advertised_mss = value;
         }
-        if let Some(value) = handshake_retries {
-            options = options.set_handshake_retries(value);
-        }
-        if let Some(value) = handshake_timeout {
-            options = options.set_handshake_timeout(value);
-        }
-        if let Some(value) = receive_window_size {
-            options = options.set_receive_window_size(value);
-        }
-        if let Some(value) = window_scale {
-            options = options.set_window_scale(value);
-        }
-        if let Some(value) = ack_delay_timeout {
-            options = options.set_ack_delay_timeout(value);
-        }
-        if let Some(value) = rx_checksum_offload {
+        if let Ok(value) = config.tcp_checksum_offload() {
             options.rx_checksum_offload = value;
-        }
-        if let Some(value) = tx_checksum_offload {
             options.tx_checksum_offload = value;
         }
 
-        options
+        Ok(options)
     }
 
     /// Gets the advertised maximum segment size in the target [TcpConfig].
@@ -123,48 +107,6 @@ impl TcpConfig {
     pub fn get_rx_checksum_offload(&self) -> bool {
         self.rx_checksum_offload
     }
-
-    /// Sets the advertised maximum segment size in the target [TcpConfig].
-    fn set_advertised_mss(mut self, value: usize) -> Self {
-        assert!(value >= MIN_MSS);
-        assert!(value <= MAX_MSS);
-        self.advertised_mss = value;
-        self
-    }
-
-    /// Sets the number of TCP handshake retries in the target [TcpConfig].
-    fn set_handshake_retries(mut self, value: usize) -> Self {
-        assert!(value > 0);
-        self.handshake_retries = value;
-        self
-    }
-
-    /// Sets the handshake TCP timeout in the target [TcpConfig].
-    fn set_handshake_timeout(mut self, value: Duration) -> Self {
-        assert!(value > Duration::new(0, 0));
-        self.handshake_timeout = value;
-        self
-    }
-
-    /// Sets the receiver window size in the target [TcpConfig].
-    fn set_receive_window_size(mut self, value: u16) -> Self {
-        assert!(value > 0);
-        self.receive_window_size = value;
-        self
-    }
-
-    /// Gets the window scale in the target [TcpConfig]
-    fn set_window_scale(mut self, value: u8) -> Self {
-        self.window_scale = value;
-        self
-    }
-
-    /// Sets the acknowledgement delay timeout in the target [TcpConfig].
-    fn set_ack_delay_timeout(mut self, value: Duration) -> Self {
-        assert!(value <= Duration::from_millis(500));
-        self.ack_delay_timeout = value;
-        self
-    }
 }
 
 //==============================================================================
@@ -178,9 +120,9 @@ impl Default for TcpConfig {
         TcpConfig {
             advertised_mss: DEFAULT_MSS,
             handshake_retries: 5,
-            handshake_timeout: Duration::from_secs(3),
+            handshake_timeout: TCP_HANDSHAKE_TIMEOUT,
             receive_window_size: 0xffff,
-            ack_delay_timeout: Duration::from_millis(5),
+            ack_delay_timeout: TCP_ACK_DELAY_TIMEOUT,
             window_scale: 0,
             rx_checksum_offload: false,
             tx_checksum_offload: false,

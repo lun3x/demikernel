@@ -16,6 +16,9 @@
  * System Calls in demi/libos.h                                                                                      *
  *===================================================================================================================*/
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
+
 /**
  * @brief Issues an invalid call to demi_socket().
  */
@@ -123,6 +126,44 @@ static bool inval_pop(void)
     return (demi_pop(qt, qd) != 0);
 }
 
+/**
+ * @brief Issues an invalid call to demi_setsockopt().
+ */
+static bool inval_setsockopt(void)
+{
+    int qd = -1;
+    int level = -1;
+    int optname = -1;
+    const void *optval = NULL;
+    socklen_t optlen = 0;
+
+    return (demi_setsockopt(qd, level, optname, optval, optlen) != 0);
+}
+
+/**
+ * @brief Issues an invalid call to demi_getsockopt().
+ */
+static bool inval_getsockopt(void)
+{
+    int qd = -1;
+    int level = -1;
+    int optname = -1;
+    void *optval = NULL;
+    socklen_t *optlen = NULL;
+
+    return (demi_getsockopt(qd, level, optname, optval, optlen) != 0);
+}
+
+/*
+* @brief Issues an invalid call to getpeername().
+*/
+static bool inval_getpeername(void)
+{
+    int qd = -1;
+
+    return (demi_getpeername(qd, NULL, NULL) != 0);
+}
+
 /*===================================================================================================================*
  * System Calls in demi/sga.h                                                                                        *
  *===================================================================================================================*/
@@ -153,18 +194,6 @@ static bool inval_sgafree(void)
  *===================================================================================================================*/
 
 /**
- * @brief Issues an invalid system call to demi_timedwait().
- */
-static bool inval_timedwait(void)
-{
-    struct timespec *abstime = NULL;
-    demi_qresult_t *qr = NULL;
-    demi_qtoken_t qt = -1;
-
-    return (demi_timedwait(qr, qt, abstime) != 0);
-}
-
-/**
  * @brief Issues an invalid system call to demi_wait().
  */
 static bool inval_wait(void)
@@ -190,6 +219,8 @@ static bool inval_wait_any(void)
     return (demi_wait_any(qr, ready_offset, qts, num_qts, timeout) != 0);
 }
 
+#pragma GCC diagnostic pop
+
 /*===================================================================================================================*
  * main()                                                                                                            *
  *===================================================================================================================*/
@@ -210,7 +241,8 @@ static struct test tests_libos[] = {{inval_socket, "invalid demi_socket()"},   {
                                     {inval_bind, "invalid demi_bind()"},       {inval_close, "invalid_demi_close()"},
                                     {inval_connect, "invalid demi_connect()"}, {inval_listen, "invalid demi_listen()"},
                                     {inval_pop, "invalid demi_pop()"},         {inval_push, "invalid demi_push()"},
-                                    {inval_pushto, "invalid demi_pushto()"}};
+                                    {inval_pushto, "invalid demi_pushto()"},   {inval_getpeername, "invalid demi_getpeername()"},
+                                    {inval_setsockopt, "invalid demi_setsockopt()"}, {inval_getsockopt, "invalid demi_getsockopt()}"}};
 
 /**
  * @brief Tests for system calls in demi/sga.h
@@ -221,9 +253,7 @@ static struct test tests_sga[] = {{inval_sgaalloc, "invalid demi_sgaalloc()"},
 /**
  * @brief Tests for system calls in demi/wait.h
  */
-static struct test tests_wait[] = {{inval_timedwait, "invalid demi_timedwait()"},
-                                   {inval_wait, "invalid demi_wait()"},
-                                   {inval_wait_any, "invalid demi_wait_any()"}};
+static struct test tests_wait[] = {{inval_wait, "invalid demi_wait()"}, {inval_wait_any, "invalid demi_wait_any()"}};
 
 /**
  * @brief Drives the application.

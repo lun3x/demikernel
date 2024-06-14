@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+mod buffer_pool;
 mod demibuffer;
+mod memory_pool;
 
 //==============================================================================
 // Imports
@@ -22,11 +24,15 @@ use ::std::{
         NonNull,
     },
 };
+
 //==============================================================================
 // Exports
 //==============================================================================
 
-pub use self::demibuffer::*;
+pub use self::{
+    buffer_pool::*,
+    demibuffer::*,
+};
 
 //==============================================================================
 // Traits
@@ -56,8 +62,15 @@ pub trait MemoryRuntime {
     }
 
     /// Allocates a scatter-gather array.
-    fn alloc_sgarray(&self, size: usize) -> Result<demi_sgarray_t, Fail> {
+    fn sgaalloc(&self, size: usize) -> Result<demi_sgarray_t, Fail> {
         // TODO: Allocate an array of buffers if requested size is too large for a single buffer.
+
+        // We can't allocate a zero-sized buffer.
+        if size == 0 {
+            let cause: String = format!("cannot allocate a zero-sized buffer");
+            error!("sgaalloc(): {}", cause);
+            return Err(Fail::new(libc::EINVAL, &cause));
+        }
 
         // We can't allocate more than a single buffer.
         if size > u16::MAX as usize {
@@ -84,7 +97,7 @@ pub trait MemoryRuntime {
     }
 
     /// Releases a scatter-gather array.
-    fn free_sgarray(&self, sga: demi_sgarray_t) -> Result<(), Fail> {
+    fn sgafree(&self, sga: demi_sgarray_t) -> Result<(), Fail> {
         // Check arguments.
         // TODO: Drop this check once we support scatter-gather arrays with multiple segments.
         if sga.sga_numsegs != 1 {

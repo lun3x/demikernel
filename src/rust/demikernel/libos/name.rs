@@ -12,11 +12,11 @@ use ::std::env;
 // Structures
 //======================================================================================================================
 
+#[derive(Clone, Copy)]
 /// Names of LibOSes.
 pub enum LibOSName {
     Catpowder,
     Catnap,
-    Catcollar,
     Catnip,
     Catmem,
     Catloop,
@@ -46,11 +46,10 @@ impl From<String> for LibOSName {
         match str.to_lowercase().as_str() {
             "catpowder" => LibOSName::Catpowder,
             "catnap" => LibOSName::Catnap,
-            "catcollar" => LibOSName::Catcollar,
             "catnip" => LibOSName::Catnip,
             "catmem" => LibOSName::Catmem,
             "catloop" => LibOSName::Catloop,
-            _ => panic!("unkown libos"),
+            _ => panic!("unknown libos"),
         }
     }
 }

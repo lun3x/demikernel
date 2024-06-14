@@ -5,6 +5,7 @@
 // Imports
 //======================================================================================================================
 
+use crate::DEFAULT_TIMEOUT;
 use anyhow::Result;
 use demikernel::{
     demi_sgarray_t,
@@ -76,7 +77,7 @@ impl TcpEchoServer {
         }
 
         // Enable the socket to accept incoming connections.
-        if let Err(e) = libos.listen(sockqd, 16) {
+        if let Err(e) = libos.listen(sockqd, 1024) {
             println!("ERROR: {:?}", e);
             libos.close(sockqd)?;
             anyhow::bail!("{:?}", e);
@@ -100,7 +101,7 @@ impl TcpEchoServer {
         // Accept first connection.
         {
             let qt: QToken = self.libos.accept(self.sockqd)?;
-            let qr: demi_qresult_t = self.libos.wait(qt, None)?;
+            let qr: demi_qresult_t = self.libos.wait(qt, Some(DEFAULT_TIMEOUT))?;
             if qr.qr_opcode != demi_opcode_t::DEMI_OPC_ACCEPT {
                 anyhow::bail!("failed to accept connection")
             }
@@ -124,7 +125,7 @@ impl TcpEchoServer {
 
             // Wait for any operation to complete.
             let qr: demi_qresult_t = {
-                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                 self.unregister_operation(index)?;
                 qr
             };
@@ -206,6 +207,7 @@ impl TcpEchoServer {
 
         // Register client.
         self.clients.insert(new_qd);
+        println!("INFO: {:?} clients connected", self.clients.len(),);
 
         // Pop first packet.
         self.issue_pop(new_qd)?;

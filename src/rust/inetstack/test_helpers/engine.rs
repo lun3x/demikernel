@@ -2,38 +2,38 @@
 // Licensed under the MIT license.
 
 use crate::{
+    demi_sgarray_t,
+    demikernel::{
+        config::Config,
+        libos::network::libos::SharedNetworkLibOS,
+    },
     inetstack::{
-        protocols::{
-            arp::SharedArpPeer,
-            ethernet2::{
-                EtherType2,
-                Ethernet2Header,
-            },
-            udp::SharedUdpPeer,
-            Peer,
-        },
-        ArpConfig,
-        TcpConfig,
-        UdpConfig,
+        test_helpers::SharedTestRuntime,
+        SharedInetStack,
     },
     runtime::{
         fail::Fail,
-        memory::DemiBuffer,
-        network::{
-            types::MacAddress,
-            NetworkRuntime,
+        memory::{
+            DemiBuffer,
+            MemoryRuntime,
         },
-        scheduler::Yielder,
-        Operation,
+        network::types::MacAddress,
+        OperationResult,
         QDesc,
         QToken,
-        SharedBox,
-        SharedObject,
+        SharedDemiRuntime,
     },
 };
-use ::libc::EBADMSG;
+use ::socket2::{
+    Domain,
+    Protocol,
+    Type,
+};
 use ::std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        VecDeque,
+    },
     net::{
         Ipv4Addr,
         SocketAddrV4,
@@ -42,160 +42,173 @@ use ::std::{
         Deref,
         DerefMut,
     },
-    pin::Pin,
     time::{
         Duration,
         Instant,
     },
 };
 
-use super::SharedTestRuntime;
-
-pub struct Engine<const N: usize> {
-    test_rig: SharedTestRuntime,
-    arp: SharedArpPeer<N>,
-    ipv4: Peer<N>,
-}
+/// A default amount of time to wait on an operation to complete. This was chosen arbitrarily.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
-pub struct SharedEngine<const N: usize>(SharedObject<Engine<N>>);
+pub struct SharedEngine(SharedNetworkLibOS<SharedInetStack<SharedTestRuntime>>);
 
-impl<const N: usize> SharedEngine<N> {
-    pub fn new(test_rig: SharedTestRuntime) -> Result<Self, Fail> {
-        let link_addr: MacAddress = test_rig.get_link_addr();
-        let ipv4_addr: Ipv4Addr = test_rig.get_ip_addr();
-        let arp_config: ArpConfig = test_rig.get_arp_config();
-        let udp_config: UdpConfig = test_rig.get_udp_config();
-        let tcp_config: TcpConfig = test_rig.get_tcp_config();
+impl SharedEngine {
+    pub fn new(config_path: &str, test_rig: SharedTestRuntime, now: Instant) -> Result<Self, Fail> {
+        let config: Config = Config::new(config_path.to_string())?;
+        // Instantiate all of the layers.
+        // Shared Demikernel runtime.
+        let runtime: SharedDemiRuntime = SharedDemiRuntime::new(now);
 
-        let boxed_test_rig: SharedBox<dyn NetworkRuntime<N>> = SharedBox::new(Box::new(test_rig.clone()));
-        let arp = SharedArpPeer::new(
-            test_rig.get_runtime(),
-            boxed_test_rig.clone(),
-            link_addr,
-            ipv4_addr,
-            arp_config,
-        )?;
-        let rng_seed: [u8; 32] = [0; 32];
-        let ipv4 = Peer::new(
-            test_rig.get_runtime(),
-            boxed_test_rig.clone(),
-            link_addr,
-            ipv4_addr,
-            udp_config,
-            tcp_config,
-            arp.clone(),
-            rng_seed,
-        )?;
-        Ok(Self(SharedObject::<Engine<N>>::new(Engine { test_rig, arp, ipv4 })))
+        let transport: SharedInetStack<SharedTestRuntime> =
+            SharedInetStack::new_test(&config, runtime.clone(), test_rig.clone())?;
+
+        Ok(Self(SharedNetworkLibOS::<SharedInetStack<SharedTestRuntime>>::new(
+            config.local_ipv4_addr()?,
+            runtime,
+            transport,
+        )))
+    }
+
+    pub fn pop_frame(&mut self) -> DemiBuffer {
+        self.get_transport().get_network().pop_frame()
+    }
+
+    pub fn pop_all_frames(&mut self) -> VecDeque<DemiBuffer> {
+        self.get_transport().get_network().pop_all_frames()
     }
 
     pub fn advance_clock(&mut self, now: Instant) {
-        self.test_rig.advance_clock(now)
+        self.get_runtime().advance_clock(now)
     }
 
     pub fn receive(&mut self, bytes: DemiBuffer) -> Result<(), Fail> {
-        let (header, payload) = Ethernet2Header::parse(bytes)?;
-        debug!("Engine received {:?}", header);
-        if self.test_rig.get_link_addr() != header.dst_addr() && !header.dst_addr().is_broadcast() {
-            return Err(Fail::new(EBADMSG, "physical destination address mismatch"));
-        }
-        match header.ether_type() {
-            EtherType2::Arp => self.arp.receive(payload),
-            EtherType2::Ipv4 => self.ipv4.receive(payload),
-            EtherType2::Ipv6 => Ok(()), // Ignore for now.
-        }
+        // We no longer do processing in this function, so we will not know if the packet is dropped or not.
+        self.get_transport().receive(bytes)?;
+        // So poll the scheduler to do the processing.
+        self.get_runtime().poll();
+        self.get_runtime().poll();
+
+        Ok(())
     }
 
     pub async fn ipv4_ping(&mut self, dest_ipv4_addr: Ipv4Addr, timeout: Option<Duration>) -> Result<Duration, Fail> {
-        self.ipv4.ping(dest_ipv4_addr, timeout).await
+        self.get_transport().ping(dest_ipv4_addr, timeout).await
     }
 
-    pub fn udp_pushto(&self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<Pin<Box<Operation>>, Fail> {
-        let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
-        udp.pushto(qd, buf, to)
+    pub fn udp_pushto(&mut self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<QToken, Fail> {
+        let data: demi_sgarray_t = self.get_transport().into_sgarray(buf)?;
+        self.pushto(qd, &data, to.into())
     }
 
-    pub fn udp_pop(&self, qd: QDesc) -> Result<Pin<Box<Operation>>, Fail> {
-        let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
-        udp.pop(qd, None)
+    pub fn udp_pop(&mut self, qd: QDesc) -> Result<QToken, Fail> {
+        self.pop(qd, None)
     }
 
     pub fn udp_socket(&mut self) -> Result<QDesc, Fail> {
-        self.ipv4.udp.socket()
+        self.socket(Domain::IPV4, Type::DGRAM, Protocol::UDP)
     }
 
     pub fn udp_bind(&mut self, socket_fd: QDesc, endpoint: SocketAddrV4) -> Result<(), Fail> {
-        self.ipv4.udp.bind(socket_fd, endpoint)
+        self.bind(socket_fd, endpoint.into())
     }
 
     pub fn udp_close(&mut self, socket_fd: QDesc) -> Result<(), Fail> {
-        self.ipv4.udp.close(socket_fd)
+        let qt = self.async_close(socket_fd)?;
+        match self.wait(qt, DEFAULT_TIMEOUT)? {
+            (_, OperationResult::Close) => Ok(()),
+            _ => unreachable!("close did not succeed"),
+        }
     }
 
     pub fn tcp_socket(&mut self) -> Result<QDesc, Fail> {
-        self.ipv4.tcp.socket()
+        self.socket(Domain::IPV4, Type::STREAM, Protocol::TCP)
     }
 
     pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> Result<QToken, Fail> {
-        self.ipv4.tcp.connect(socket_fd, remote_endpoint)
+        self.connect(socket_fd, remote_endpoint.into())
     }
 
     pub fn tcp_bind(&mut self, socket_fd: QDesc, endpoint: SocketAddrV4) -> Result<(), Fail> {
-        self.ipv4.tcp.bind(socket_fd, endpoint)
+        self.bind(socket_fd, endpoint.into())
     }
 
     pub fn tcp_accept(&mut self, fd: QDesc) -> Result<QToken, Fail> {
-        self.ipv4.tcp.accept(fd)
+        self.accept(fd)
     }
 
     pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
-        self.ipv4.tcp.push(socket_fd, buf)
+        let data: demi_sgarray_t = self.get_transport().into_sgarray(buf)?;
+        self.push(socket_fd, &data)
     }
 
     pub fn tcp_pop(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
-        self.ipv4.tcp.pop(socket_fd, None)
+        self.pop(socket_fd, None)
     }
 
     pub fn tcp_async_close(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
-        self.ipv4.tcp.async_close(socket_fd)
+        self.async_close(socket_fd)
     }
 
     pub fn tcp_listen(&mut self, socket_fd: QDesc, backlog: usize) -> Result<(), Fail> {
-        self.ipv4.tcp.listen(socket_fd, backlog)
+        self.listen(socket_fd, backlog)
     }
 
-    pub async fn arp_query(&mut self, ipv4_addr: Ipv4Addr) -> Result<MacAddress, Fail> {
-        self.arp.query(ipv4_addr, &Yielder::new()).await
-    }
-
-    pub fn tcp_mss(&self, handle: QDesc) -> Result<usize, Fail> {
-        self.ipv4.tcp_mss(handle)
-    }
-
-    pub fn tcp_rto(&self, handle: QDesc) -> Result<Duration, Fail> {
-        self.ipv4.tcp_rto(handle)
+    pub async fn arp_query(self, ipv4_addr: Ipv4Addr) -> Result<MacAddress, Fail> {
+        self.get_transport().arp_query(ipv4_addr).await
     }
 
     pub fn export_arp_cache(&self) -> HashMap<Ipv4Addr, MacAddress> {
-        self.arp.export_cache()
+        self.get_transport().export_arp_cache()
     }
 
-    pub fn get_test_rig(&self) -> SharedTestRuntime {
-        self.test_rig.clone()
+    pub fn poll(&self) {
+        self.get_runtime().poll()
+    }
+
+    pub fn wait(&self, qt: QToken, timeout: Duration) -> Result<(QDesc, OperationResult), Fail> {
+        // First check if the task has already completed.
+        if let Some(result) = self.get_runtime().get_completed_task(&qt) {
+            return Ok(result);
+        }
+
+        // Otherwise, run the scheduler.
+        // Put the QToken into a single element array.
+        let qt_array: [QToken; 1] = [qt];
+        let mut prev: Instant = Instant::now();
+        let mut remaining_time: Duration = timeout;
+
+        // Call run_any() until the task finishes.
+        loop {
+            // Run for one quanta and if one of our queue tokens completed, then return.
+            if let Some((offset, qd, qr)) = self.get_runtime().run_any(&qt_array, remaining_time) {
+                debug_assert_eq!(offset, 0);
+                return Ok((qd, qr));
+            }
+            let now: Instant = Instant::now();
+            let elapsed_time: Duration = now - prev;
+            if elapsed_time >= remaining_time {
+                break;
+            } else {
+                remaining_time = remaining_time - elapsed_time;
+                prev = now;
+            }
+        }
+        Err(Fail::new(libc::ETIMEDOUT, "wait timed out"))
     }
 }
 
-impl<const N: usize> Deref for SharedEngine<N> {
-    type Target = Engine<N>;
+impl Deref for SharedEngine {
+    type Target = SharedNetworkLibOS<SharedInetStack<SharedTestRuntime>>;
 
     fn deref(&self) -> &Self::Target {
-        self.0.deref()
+        &self.0
     }
 }
 
-impl<const N: usize> DerefMut for SharedEngine<N> {
+impl DerefMut for SharedEngine {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.deref_mut()
+        &mut self.0
     }
 }

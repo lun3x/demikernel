@@ -68,44 +68,49 @@ SyscallEvent -> glue::SyscallEvent
 
 Syscall -> DemikernelSyscall
       : 'SOCKET' 'LPAREN' SocketArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Socket($3, ret)
       }
       | 'BIND' 'LPAREN' BindArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Bind($3, ret)
       }
       | 'LISTEN' 'LPAREN' ListenArgs 'RPAREN' 'EQUALS' Expression{
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Listen($3, ret)
       }
       | 'ACCEPT' 'LPAREN' AcceptArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Accept($3, ret)
       }
       | 'CONNECT' 'LPAREN' ConnectArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Connect($3, ret)
       }
       | 'SEND' 'LPAREN' WriteArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Push($3, ret)
       }
       | 'RECV' 'LPAREN' SyscallArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Pop(ret)
       }
-      | 'CLOSE' 'LPAREN' SyscallArgs 'RPAREN' 'EQUALS' Expression {
-            DemikernelSyscall::Close
+      | 'CLOSE' 'LPAREN' CloseArgs 'RPAREN' 'EQUALS' Expression {
+            let ret = glue::parse_ret_code(&$6).unwrap();
+            DemikernelSyscall::Close($3, ret)
       }
       | 'WRITE' 'LPAREN' WriteArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Push($3, ret)
       }
       | 'READ' 'LPAREN' SyscallArgs 'RPAREN' 'EQUALS' Expression {
-            let ret = glue::parse_int(&$6).unwrap();
+            let ret = glue::parse_ret_code(&$6).unwrap();
             DemikernelSyscall::Pop(ret)
-            }
+      }
+      | 'WAIT' 'LPAREN' WaitArgs 'RPAREN' 'EQUALS' Expression {
+            let ret = glue::parse_ret_code(&$6).unwrap();
+            DemikernelSyscall::Wait($3, ret)
+      }
       | 'GETSOCKOPT' 'LPAREN' SyscallArgs 'RPAREN' 'EQUALS' Expression {
             DemikernelSyscall::Unsupported
       }
@@ -193,6 +198,31 @@ WriteArgs -> glue::PushArgs
                   qd: Some(qd),
                   buf: None,
                   len: Some(len),
+            }
+      }
+      ;
+
+WaitArgs -> glue::WaitArgs
+      : 'INTEGER' 'COMMA' 'ELLIPSIS' {
+            let qd = {
+                  let v = $1.map_err(|_| ()).unwrap();
+                  glue::parse_int($lexer.span_str(v.span())).unwrap()
+            };
+            glue::WaitArgs {
+                  qd: Some(qd),
+                  timeout: None
+            }
+      }
+      ;
+
+CloseArgs -> glue::CloseArgs
+      : 'INTEGER' {
+            let qd = {
+                  let v = $1.map_err(|_| ()).unwrap();
+                  glue::parse_int($lexer.span_str(v.span())).unwrap()
+            };
+            glue::CloseArgs {
+                  qd,
             }
       }
       ;
@@ -292,6 +322,11 @@ TcpFlags -> glue::TcpFlags
             flags.ack = true;
             flags
       }
+      | 'F' TcpFlags {
+            let mut flags = $2;
+            flags.fin = true;
+            flags
+      }
       | 'S' TcpFlags {
             let mut flags = $2;
             flags.syn = true;
@@ -302,25 +337,25 @@ TcpFlags -> glue::TcpFlags
             flags.psh = true;
             flags
       }
+      | 'R' TcpFlags {
+            let mut flags = $2;
+            flags.rst = true;
+            flags
+      }
       ;
 
 TcpSequenceNumber -> glue::TcpSequenceNumber
-      : 'INTEGER' 'COLON' 'INTEGER' 'LPAREN' 'INTEGER' 'RPAREN' {
+      : 'SEQ' 'INTEGER' 'LPAREN' 'INTEGER' 'RPAREN' {
             let seq = {
-                  let v = $1.map_err(|_| ()).unwrap();
-                  glue::parse_int($lexer.span_str(v.span())).unwrap()
-            };
-            let ack = {
-                  let v = $3.map_err(|_| ()).unwrap();
+                  let v = $2.map_err(|_| ()).unwrap();
                   glue::parse_int($lexer.span_str(v.span())).unwrap()
             };
             let win = {
-                  let v = $5.map_err(|_| ()).unwrap();
+                  let v = $4.map_err(|_| ()).unwrap();
                   glue::parse_int($lexer.span_str(v.span())).unwrap()
             };
             glue::TcpSequenceNumber {
                   seq,
-                  ack,
                   win,
             }
       }

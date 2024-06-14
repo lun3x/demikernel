@@ -9,14 +9,13 @@ specification, check out the `README.md` file.
 
 ## Table of Contents
 
+- [Table of Contents](#table-of-contents)
 - [1. Clone This Repository](#1-clone-this-repository)
 - [2. Install Third-Party Requirements](#2-install-third-party-requirements)
 - [3. Install Rust Toolchain](#3-install-rust-toolchain)
 - [4. Build DPDK Library (For Catnip and Only Once)](#4-build-dpdk-library-for-catnip-and-only-once)
-- [5. Build IO Uring Library (For Catcollar and Only Once)](#5-build-io-uring-library-for-catcollar-and-only-once)
-- [6. Setup Configuration File (Only Once)](#6-setup-configuration-file-only-once)
-- [7. Enable Huge Pages (Optional for Catnip at Every System Reboot)](#7-enable-huge-pages-optional-for-catnip-at-every-system-reboot)
-
+- [5. Setup Configuration File (Only Once)](#5-setup-configuration-file-only-once)
+- [6. Enable Huge Pages (Only for Catnip on Every System Reboot)](#6-enable-huge-pages-only-for-catnip-on-every-system-reboot)
 
 > **Follow these instructions to build Demikernel on a fresh Ubuntu 22.04 system.**
 
@@ -25,7 +24,7 @@ specification, check out the `README.md` file.
 ```bash
 export WORKDIR=$HOME                                                  # Change this to whatever you want.
 cd $WORKDIR                                                           # Switch to working directory.
-git clone --recursive https://github.com/demikernel/demikernel.git    # Recursive clone.
+git clone --recursive https://github.com/microsoft/demikernel.git    # Recursive clone.
 cd $WORKDIR/demikernel                                                # Switch to repository's source tree.
 ```
 
@@ -52,27 +51,19 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ./scripts/setup/dpdk.sh
 ```
 
-## 5. Build IO Uring Library (For Catcollar and Only Once)
+## 5. Setup Configuration File (Only Once)
 
-```bash
-./scripts/setup/io_uring.sh
-```
-
-## 6. Setup Configuration File (Only Once)
-
-- Copy the template from `scripts/config/default.yaml` to `$HOME/config.yaml`.
+- Copy the template from `scripts/config/default.yaml` to
+  `$HOME/config.yaml`. If running on Azure, use `scripts/config/azure.yaml`.
 - Open the file in `$HOME/config.yaml` for editing and do the following:
-  - Change `XX.XX.XX.XX` to match the IPv4 address of your server host.
-  - Change `YY.YY.YY.YY` to match the IPv4 address of your client host.
-  - Change `PPPP` to the port number that you will expose in the server host.
-  - Change `ZZ.ZZ.ZZ.ZZ` to match the IPv4 address that in the local host.
+  - Change `XX.XX.XX.XX` to match the IPv4 address that in the local host.
   - Change `ff:ff:ff:ff:ff:ff` to match the MAC address in the local host.
   - Change `abcde` to match the name of the interface in the local host.
-  - Change the `arp_table` according to your setup.
+  - Change the `arp_table` according to your setup. Each line should contain the MAC address of a host matched to the IP address of the same host.
   - If using DPDK, change `WW:WW.W` to match the PCIe address of your NIC.
 - Save the file.
 
-## 7. Enable Huge Pages (Only for Catnip on Every System Reboot)
+## 6. Enable Huge Pages (Only for Catnip on Every System Reboot)
 
 ```bash
 sudo -E ./scripts/setup/hugepages.sh

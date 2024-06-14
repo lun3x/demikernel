@@ -11,39 +11,38 @@ use self::{
     sender::sender,
 };
 use crate::{
+    async_timer,
     inetstack::protocols::tcp::established::ctrlblk::SharedControlBlock,
     runtime::{
-        scheduler::Yielder,
+        network::NetworkRuntime,
         QDesc,
     },
 };
 use ::futures::{
     channel::mpsc,
+    pin_mut,
     FutureExt,
 };
 
-pub async fn background<const N: usize>(cb: SharedControlBlock<N>, _dead_socket_tx: mpsc::UnboundedSender<QDesc>) {
-    let yielder_acknowledger: Yielder = Yielder::new();
-    let acknowledger = acknowledger(cb.clone(), yielder_acknowledger).fuse();
-    futures::pin_mut!(acknowledger);
+pub async fn background<N: NetworkRuntime>(cb: SharedControlBlock<N>, _dead_socket_tx: mpsc::UnboundedSender<QDesc>) {
+    let acknowledger = async_timer!("tcp::established::background::acknowledger", acknowledger(cb.clone())).fuse();
+    pin_mut!(acknowledger);
 
-    let yielder_retransmitter: Yielder = Yielder::new();
-    let retransmitter = retransmitter(cb.clone(), yielder_retransmitter).fuse();
-    futures::pin_mut!(retransmitter);
+    let retransmitter = async_timer!("tcp::established::background::retransmitter", retransmitter(cb.clone())).fuse();
+    pin_mut!(retransmitter);
 
-    let yielder_sender: Yielder = Yielder::new();
-    let sender = sender(cb.clone(), yielder_sender).fuse();
-    futures::pin_mut!(sender);
+    let sender = async_timer!("tcp::established::background::sender", sender(cb.clone())).fuse();
+    pin_mut!(sender);
+
+    let mut cb2: SharedControlBlock<N> = cb.clone();
+    let receiver = async_timer!("tcp::established::background::receiver", cb2.poll()).fuse();
+    pin_mut!(receiver);
 
     let r = futures::select_biased! {
+        r = receiver => r,
         r = acknowledger => r,
         r = retransmitter => r,
         r = sender => r,
     };
     error!("Connection terminated: {:?}", r);
-
-    // TODO Properly clean up Peer state for this connection.
-    // dead_socket_tx
-    //     .unbounded_send(fd)
-    //     .expect("Failed to terminate connection");
 }

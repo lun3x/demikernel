@@ -1,4 +1,4 @@
-catnapw:
+catpowder:
   udp_ping_pong: {}
   udp_push_pop: {}
   tcp_close:
@@ -18,4 +18,4 @@ catnapw:
     nclients: [1, 32]
     nrequests: [128, 1024]
     run_mode: [sequential, concurrent]
-    nthreads: [1, 2, 4]
+    nthreads: [1]

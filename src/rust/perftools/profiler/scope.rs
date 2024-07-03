@@ -7,8 +7,11 @@
 // Imports
 //======================================================================================================================
 
-use crate::perftools::profiler::PROFILER;
-use std::{
+use crate::{
+    perftools::profiler::PROFILER,
+    runtime::types::demi_callback_t,
+};
+use ::std::{
     cell::RefCell,
     fmt::{
         self,
@@ -22,6 +25,7 @@ use std::{
         Context,
         Poll,
     },
+    thread,
 };
 
 //======================================================================================================================
@@ -39,6 +43,9 @@ pub struct Scope {
 
     /// Child scopes in the tree.
     succs: Vec<Rc<RefCell<Scope>>>,
+
+    /// Callback to report statistics. If this is set to None, we collect averages by default.
+    perf_callback: Option<demi_callback_t>,
 
     /// How often has this scope been visited?
     num_calls: usize,
@@ -63,13 +70,14 @@ pub struct AsyncScope<'a, F: Future> {
 //======================================================================================================================
 
 impl Scope {
-    pub fn new(name: &'static str, pred: Option<Rc<RefCell<Scope>>>) -> Scope {
+    pub fn new(name: &'static str, pred: Option<Rc<RefCell<Scope>>>, perf_callback: Option<demi_callback_t>) -> Scope {
         Scope {
             name,
             pred,
             succs: Vec::new(),
             num_calls: 0,
             duration_sum: 0,
+            perf_callback,
         }
     }
 
@@ -108,16 +116,21 @@ impl Scope {
     /// Leave this scope. Called automatically by the `Guard` instance.
     #[inline]
     pub fn leave(&mut self, duration: u64) {
-        self.num_calls += 1;
+        if let Some(callback) = self.perf_callback {
+            callback(self.name.as_ptr() as *const i8, self.name.len() as u32, duration);
+        } else {
+            self.num_calls += 1;
 
-        // Even though this is extremely unlikely, let's not panic on overflow.
-        self.duration_sum = self.duration_sum + duration;
+            // Even though this is extremely unlikely, let's not panic on overflow.
+            self.duration_sum = self.duration_sum + duration;
+        }
     }
 
     /// Dump statistics.
     pub fn write_recursive<W: io::Write>(
         &self,
         out: &mut W,
+        thread_id: thread::ThreadId,
         total_duration: u64,
         depth: usize,
         max_depth: Option<usize>,
@@ -135,7 +148,7 @@ impl Scope {
             .pred
             .clone()
             .map_or(total_duration_secs, |pred| (pred.borrow().duration_sum) as f64);
-        let percent = duration_sum_secs / pred_sum_secs * 100.0;
+        let percent_time = duration_sum_secs / pred_sum_secs * 100.0;
 
         // Write markers.
         let mut markers = String::from("+");
@@ -144,9 +157,9 @@ impl Scope {
         }
         writeln!(
             out,
-            "{};{};{};{}",
-            format!("{};{}", markers, self.name),
-            percent,
+            "{},{},{},{}",
+            format!("{},{:?},{}", markers, thread_id, self.name),
+            percent_time,
             duration_sum_secs / (self.num_calls as f64),
             duration_sum_secs / (self.num_calls as f64) * ns_per_cycle,
         )?;
@@ -154,7 +167,7 @@ impl Scope {
         // Write children
         for succ in &self.succs {
             succ.borrow()
-                .write_recursive(out, total_duration, depth + 1, max_depth, ns_per_cycle)?;
+                .write_recursive(out, thread_id, total_duration, depth + 1, max_depth, ns_per_cycle)?;
         }
 
         Ok(())

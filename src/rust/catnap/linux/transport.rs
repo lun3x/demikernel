@@ -306,7 +306,7 @@ impl NetworkTransport for SharedCatnapTransport {
         let socket: Socket = match socket2::Socket::new(domain, typ, Some(protocol)) {
             Ok(socket) => {
                 // Set socket options.
-                if let Err(e) = socket.set_reuse_address(true) {
+                if let Err(e) = socket.set_reuse_address(false) {
                     let cause: String = format!("cannot set REUSE_ADDRESS option: {:?}", e);
                     let errno: i32 = get_libc_err(e);
                     error!("socket(): {}", cause);
@@ -463,23 +463,23 @@ impl NetworkTransport for SharedCatnapTransport {
         let socket: &mut Socket = self.socket_from_sd(sd);
 
         // Set SO_REUSE_PORT.
-        let optval: libc::c_int = 1;
-        let optval_len: libc::socklen_t = std::mem::size_of_val(&optval) as libc::socklen_t;
-        if unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                optval_len,
-            )
-        } < 0
-        {
-            let e: i32 = get_libc_err(io::Error::last_os_error());
-            let cause: String = format!("failed to bind socket: {:?}", e);
-            error!("bind(): {}", cause);
-            return Err(Fail::new(e, &cause));
-        }
+        // let optval: libc::c_int = 1;
+        // let optval_len: libc::socklen_t = std::mem::size_of_val(&optval) as libc::socklen_t;
+        // if unsafe {
+        //     libc::setsockopt(
+        //         socket.as_raw_fd(),
+        //         libc::SOL_SOCKET,
+        //         libc::SO_REUSEPORT,
+        //         &optval as *const _ as *const libc::c_void,
+        //         optval_len,
+        //     )
+        // } < 0
+        // {
+        //     let e: i32 = get_libc_err(io::Error::last_os_error());
+        //     let cause: String = format!("failed to bind socket: {:?}", e);
+        //     error!("bind(): {}", cause);
+        //     return Err(Fail::new(e, &cause));
+        // }
 
         if let Err(e) = socket.bind(&local.into()) {
             let cause: String = format!("failed to bind socket: {:?}", e);
@@ -514,7 +514,7 @@ impl NetworkTransport for SharedCatnapTransport {
         timer!("catnap::linux::transport::accept");
         let (new_socket, addr) = self.data_from_sd(sd).accept().await?;
         // Set socket options.
-        if let Err(e) = new_socket.set_reuse_address(true) {
+        if let Err(e) = new_socket.set_reuse_address(false) {
             let cause: String = format!("cannot set REUSE_ADDRESS option: {:?}", e);
             new_socket.shutdown(Shutdown::Both)?;
             error!("accept(): {}", cause);

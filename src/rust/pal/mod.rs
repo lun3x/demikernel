@@ -39,7 +39,7 @@ use libc::sockaddr_in;
 // Common constants
 //======================================================================================================================
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 pub const CPU_DATA_CACHE_LINE_SIZE_IN_BYTES: usize = 64;
 
 const _: () = assert!(CPU_DATA_CACHE_LINE_SIZE_IN_BYTES.is_power_of_two());
